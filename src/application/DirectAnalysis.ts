@@ -30,11 +30,7 @@ import {
   snapshotEvidenceForQuery,
   snapshotMatchesTarget,
 } from "../domain/analysisSnapshot.js";
-import {
-  analysisProfileSchema,
-  committedProviderSchema,
-  type AnalysisProfileCommitment,
-} from "../domain/analysisProfile.js";
+import type { AnalysisProfileCommitment } from "../domain/analysisProfile.js";
 import { err, ok, type Result } from "../domain/result.js";
 import type { AnalysisSnapshot } from "../domain/analysisSnapshot.js";
 import type {
@@ -45,8 +41,20 @@ import {
   REA_WORKFLOW_PROVIDER,
   workflowAnalysisProfile,
 } from "./InvestigationProviders.js";
+import {
+  createWorkflowEvidence,
+  workflowSnapshotRecord,
+  recordWorkflowUnknowns,
+} from "./WorkflowEvidence.js";
 import type { AnalysisProviderSelector } from "../contracts/providerSelection.js";
 import { artifactInspectionResultSchema } from "../domain/artifactInspection.js";
+import { resolveXrefsAddress } from "./XrefsAddressResolution.js";
+import { AnalysisInputError } from "../domain/analysisErrorCore.js";
+import {
+  directAnalysisCleanupFailure,
+  managedAnalysisCleanupFailure,
+  withSessionCleanup,
+} from "./DirectAnalysisCleanup.js";
 
 type DirectAnalysisTool =
   | "annotate_native_function"
@@ -131,13 +139,15 @@ export const runManagedProviderExecution = async (
 ): Promise<Result<AnalysisExecution, AnalysisError>> =>
   withProcessCancellation(signal, async (operationSignal) => {
     const session = dependencies.createManagedBinarySession();
-    try {
-      const opened = await session.open(path, { signal: operationSignal });
-      if (!opened.ok) return opened;
-      return await session.execute(tool, {}, { signal: operationSignal });
-    } finally {
-      await session.close();
-    }
+    return withSessionCleanup(
+      session,
+      async () => {
+        const opened = await session.open(path, { signal: operationSignal });
+        if (!opened.ok) return opened;
+        return await session.execute(tool, {}, { signal: operationSignal });
+      },
+      managedAnalysisCleanupFailure,
+    );
   });
 
 const runManagedProviderAnalysis = async (
@@ -193,129 +203,121 @@ const runAnalysis = async (
   const config = parseConfig(options.environment ?? process.env);
   if (!config.ok) return cliError(config.error);
   const session = dependencies.createBinarySession(config.value, logger);
-  try {
-    const prepared = await prepareSnapshot({
-      path,
-      snapshotPath,
-      ...(options.formatHint === undefined
-        ? {}
-        : { formatHint: options.formatHint }),
-    });
-    if (!prepared.ok) return cliError(prepared.error);
-    const { snapshot } = prepared.value;
-    let resolvedTarget: ResolvedSessionOpen | undefined;
-    if (snapshot !== undefined && prepared.value.target !== undefined) {
-      const preview = await session.previewTarget(prepared.value.target, {
-        signal,
-        snapshot,
+  return withSessionCleanup(
+    session,
+    async () => {
+      const prepared = await prepareSnapshot({
+        path,
+        snapshotPath,
         ...(options.formatHint === undefined
           ? {}
           : { formatHint: options.formatHint }),
+      });
+      if (!prepared.ok) return cliError(prepared.error);
+      const { snapshot } = prepared.value;
+      let resolvedTarget: ResolvedSessionOpen | undefined;
+      if (snapshot !== undefined && prepared.value.target !== undefined) {
+        const preview = await session.previewTarget(prepared.value.target, {
+          signal,
+          snapshot,
+          ...(options.formatHint === undefined
+            ? {}
+            : { formatHint: options.formatHint }),
+          ...(options.providerId === undefined
+            ? {}
+            : { providerId: options.providerId }),
+        });
+        if (!preview.ok) return cliError(preview.error);
+        resolvedTarget = preview.value;
+        const route = preview.value.route;
+        const bindingProfile = route.profile ?? undefined;
+        const evidenceProfile = analysisProfileForRoute(route, tool);
+        if (
+          bindingProfile !== undefined &&
+          evidenceProfile !== undefined &&
+          allowsSnapshotReplay(route, tool)
+        ) {
+          const cached = snapshotEvidenceForQuery(snapshot, {
+            target: preview.value.target,
+            bindingProfile,
+            operation: tool,
+            parameters: arguments_,
+            provider: isWorkflowEvidenceTool(tool)
+              ? REA_WORKFLOW_PROVIDER
+              : providerIdentityForRoute(route, tool),
+            evidenceProfile,
+          });
+          if (cached !== undefined) return cached;
+        }
+      }
+      const openOptions = {
+        signal,
+        ...(options.formatHint === undefined
+          ? {}
+          : { formatHint: options.formatHint }),
+        ...(snapshot === undefined ? {} : { snapshot }),
         ...(options.providerId === undefined
           ? {}
           : { providerId: options.providerId }),
+      };
+      const opened =
+        resolvedTarget === undefined
+          ? await session.open(path, openOptions)
+          : await session.openResolvedTarget(resolvedTarget, openOptions);
+      if (!opened.ok) return cliError(opened.error);
+      const evidenceProfile = analysisProfileForEvidence(session, tool);
+      const { output, evidence } = await executeAnalysisTool({
+        session,
+        openedTarget: opened.value,
+        tool,
+        arguments: arguments_,
+        signal,
+        evidenceProfile,
       });
-      if (!preview.ok) return cliError(preview.error);
-      resolvedTarget = preview.value;
-      const route = preview.value.route;
-      const bindingProfile = route.profile ?? undefined;
-      const evidenceProfile = analysisProfileForRoute(route, tool);
-      if (
-        bindingProfile !== undefined &&
-        evidenceProfile !== undefined &&
-        allowsSnapshotReplay(route, tool)
-      ) {
-        const cached = snapshotEvidenceForQuery(snapshot, {
-          target: preview.value.target,
-          bindingProfile,
-          operation: tool,
-          parameters: arguments_,
-          provider: isWorkflowEvidenceTool(tool)
-            ? REA_WORKFLOW_PROVIDER
-            : providerIdentityForRoute(route, tool),
-          evidenceProfile,
-        });
-        if (cached !== undefined) return cached;
+      if (evidence !== undefined) {
+        const recorded = session.recordEvidence(evidence);
+        if (!recorded.ok) return cliError(recorded.error);
+        if (isWorkflowEvidenceTool(tool)) {
+          const unknowns = recordWorkflowUnknowns({
+            name: tool,
+            result: evidence.normalized_result,
+            evidenceId: evidence.evidence_id,
+            recordUnknown: (unknown) => session.recordUnknown(unknown),
+          });
+          if (!unknowns.ok) return cliError(unknowns.error);
+        }
       }
-    }
-    const openOptions = {
-      signal,
-      ...(options.formatHint === undefined
-        ? {}
-        : { formatHint: options.formatHint }),
-      ...(snapshot === undefined ? {} : { snapshot }),
-      ...(options.providerId === undefined
-        ? {}
-        : { providerId: options.providerId }),
-    };
-    const opened =
-      resolvedTarget === undefined
-        ? await session.open(path, openOptions)
-        : await session.openResolvedTarget(resolvedTarget, openOptions);
-    if (!opened.ok) return cliError(opened.error);
-    const evidenceProfile = analysisProfileForEvidence(session, tool);
-    const { output, evidence } = await executeAnalysisTool({
-      session,
-      openedTarget: opened.value,
-      tool,
-      arguments: arguments_,
-      signal,
-      evidenceProfile,
-    });
-    if (evidence !== undefined) session.recordEvidence(evidence);
-    if (
-      isWorkflowEvidenceTool(tool) &&
-      tool !== "trace_native_ui_action" &&
-      snapshotPath !== undefined &&
-      evidence !== undefined &&
-      "analysis_profile" in evidence &&
-      session.allowsSnapshotReplay(tool)
-    ) {
-      const recorded = session.recordWorkflowSnapshot({
-        operation: tool,
-        parameters: arguments_,
-        execution: {
-          result: evidence.normalized_result,
-          rawResult: evidence.raw_result,
-          provider: committedProviderSchema.parse(evidence.provider),
-          analysisProfile: analysisProfileSchema.parse(
-            evidence.analysis_profile,
-          ),
-          limitations: evidence.limitations,
-          locations: evidence.locations,
-          subject:
-            evidence.subject === null
-              ? null
-              : {
-                  path: evidence.subject.local_path,
-                  sha256: evidence.subject.digest.sha256,
-                  format: evidence.subject.format,
-                  ...(evidence.subject.architecture === null
-                    ? {}
-                    : { architecture: evidence.subject.architecture }),
-                },
-        },
-      });
-      if (!recorded.ok) return cliError(recorded.error);
-    }
-    if (
-      tool !== "trace_native_ui_action" &&
-      snapshotPath !== undefined &&
-      evidence !== undefined
-    ) {
-      const snapshot = session.exportAnalysisSnapshot();
-      if (!snapshot.ok) return cliError(snapshot.error);
-      const written = await writeAnalysisSnapshot(
-        snapshot.value,
-        snapshotPath,
-        true,
-      );
-      if (!written.ok) return cliError(written.error);
-    }
-    return output;
-  } finally {
-    await session.close();
-  }
+      if (
+        isWorkflowEvidenceTool(tool) &&
+        tool !== "trace_native_ui_action" &&
+        snapshotPath !== undefined &&
+        evidence !== undefined &&
+        session.allowsSnapshotReplay(tool)
+      ) {
+        const workflowRecord = workflowSnapshotRecord(evidence, tool);
+        if (workflowRecord !== undefined) {
+          const recorded = session.recordWorkflowSnapshot(workflowRecord);
+          if (!recorded.ok) return cliError(recorded.error);
+        }
+      }
+      if (
+        tool !== "trace_native_ui_action" &&
+        snapshotPath !== undefined &&
+        evidence !== undefined
+      ) {
+        const snapshot = session.exportAnalysisSnapshot();
+        if (!snapshot.ok) return cliError(snapshot.error);
+        const written = await writeAnalysisSnapshot(
+          snapshot.value,
+          snapshotPath,
+          true,
+        );
+        if (!written.ok) return cliError(written.error);
+      }
+      return output;
+    },
+    directAnalysisCleanupFailure,
+  );
 };
 
 const executeAnalysisTool = async (input: {
@@ -356,19 +358,43 @@ const executeAnalysisTool = async (input: {
       signal,
     );
     if (!result.ok) return { output: cliError(result.error) };
-    const evidence = createEvidence(input.openedTarget, REA_WORKFLOW_PROVIDER, {
+    const evidence = createWorkflowEvidence({
+      target: input.openedTarget,
       operation: tool,
       parameters: input.arguments,
       result: result.value,
-      ...(evidenceProfile === undefined
-        ? {}
-        : { analysisProfile: evidenceProfile }),
-      confidence: "derived",
-      limitations: ["Derived by an REA composed workflow."],
+      upstreamProfile: evidenceProfile,
     });
     return { output: evidence, evidence };
   }
-  const result = await session.execute(tool, input.arguments, { signal });
+  let result = await session.execute(tool, input.arguments, { signal });
+  if (
+    tool === "xrefs" &&
+    typeof input.arguments.address === "string" &&
+    !result.ok &&
+    result.error instanceof AnalysisInputError &&
+    !result.error.cleanupIncomplete &&
+    result.error.issues.length > 0 &&
+    result.error.issues.every(
+      ({ path, reason }) =>
+        path.length === 1 &&
+        path[0] === "address" &&
+        reason === "invalid_format",
+    )
+  ) {
+    const address = await resolveXrefsAddress(
+      session,
+      input.arguments.address,
+      signal,
+    );
+    if (!address.ok) return { output: cliError(address.error) };
+    if (address.value !== input.arguments.address)
+      result = await session.execute(
+        tool,
+        { ...input.arguments, address: address.value },
+        { signal },
+      );
+  }
   if (!result.ok) return { output: cliError(result.error) };
   const evidence = createEvidence(
     result.value.subject ?? input.openedTarget,
@@ -400,11 +426,15 @@ const withProcessCancellation = async <Value>(
   if (suppliedSignal !== undefined) return operation(suppliedSignal);
   const controller = new AbortController();
   const cancel = (): void => controller.abort();
-  process.once("SIGINT", cancel);
+  // Package runners can forward a terminal interrupt after REA already received
+  // it directly. Keep both guards installed until provider cleanup has settled.
+  process.on("SIGINT", cancel);
+  process.on("SIGTERM", cancel);
   try {
     return await operation(controller.signal);
   } finally {
     process.off("SIGINT", cancel);
+    process.off("SIGTERM", cancel);
   }
 };
 
@@ -467,7 +497,8 @@ const analysisProfileForRoute = (
 ): AnalysisProfileCommitment | undefined => {
   const profile = route.profile;
   if (profile === null || profile === undefined) return undefined;
-  if (isWorkflowEvidenceTool(tool)) return workflowAnalysisProfile(profile);
+  if (isWorkflowEvidenceTool(tool))
+    return workflowAnalysisProfile(profile, tool);
   const provider = providerIdentityForRoute(route, tool);
   return provider.id === profile.provider.id ? profile : undefined;
 };
@@ -493,8 +524,7 @@ const analysisProfileForEvidence = (
     | DirectAnalysisTool,
 ): AnalysisProfileCommitment | undefined => {
   if (!isWorkflowEvidenceTool(tool)) return session.analysisProfile(tool);
-  const upstream = session.analysisProfile();
-  return upstream === undefined ? undefined : workflowAnalysisProfile(upstream);
+  return session.analysisProfile();
 };
 
 const isWorkflowEvidenceTool = (

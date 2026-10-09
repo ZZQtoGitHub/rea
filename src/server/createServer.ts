@@ -1,4 +1,15 @@
-import { McpServer } from "@modelcontextprotocol/server";
+import type { EvmInterfaceService } from "../application/evm/EvmInterfaceService.js";
+import { createEvmInterfaceService } from "../composition/evm.js";
+import { registerEvmTools } from "./registerEvmTools.js";
+import { registerRecordedCrashTools } from "./registerRecordedCrashTools.js";
+import { createRecordedCrashService } from "../composition/binaryDiagnostics.js";
+import type { RecordedCrashService } from "../application/binaryDiagnostics/RecordedCrashService.js";
+import { registerAnalysisViewTool } from "./registerAnalysisViewTool.js";
+import { registerBinaryDiagnosticsTools } from "./registerBinaryDiagnosticsTools.js";
+import { createBinaryLayoutService } from "../composition/binaryDiagnostics.js";
+import type { BinaryLayoutService } from "../application/binaryDiagnostics/BinaryLayoutService.js";
+import type { McpServer } from "@modelcontextprotocol/server";
+import { EvidenceMcpServer } from "./EvidenceMcpServer.js";
 import { isAbsolute } from "node:path";
 
 import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
@@ -59,7 +70,10 @@ const ACTIVE_TARGET_INSTRUCTIONS =
   "REA analyzes the active reverse-engineering target. Use the analysis tool that answers the question directly. Search or list symbols when discovery is needed; analyze_function provides a function dossier, and focused procedure tools return individual facets.";
 
 export interface CreateServerOptions {
+  readonly evmInterface?: EvmInterfaceService;
   readonly logger?: Logger;
+  readonly binaryLayout?: BinaryLayoutService;
+  readonly recordedCrash?: RecordedCrashService;
   readonly firmwareAnalysis?: FirmwareAnalysisPort;
   readonly javascriptRecovery?: JavaScriptRecoveryPort;
   readonly webModuleTrace?: WebModuleTraceService;
@@ -85,9 +99,22 @@ const installSessionToolAvailability = (
   const policy = sessionAvailabilityPolicy(options.availabilityPolicy, {
     optionalProviderLoadFailures: options.optionalProviderLoadFailures,
     optionalFeatures: {
+      evmInterfaceEnabled:
+        options.evmInterface !== undefined ||
+        (process.platform === "linux" && process.arch === "x64"),
       webModuleResolutionEnabled:
         options.webModuleTrace !== undefined ||
         isAbsolute(process.env.REA_BROWSER_EXECUTABLE ?? ""),
+      recordedCrashEnabled:
+        options.recordedCrash !== undefined ||
+        (process.platform === "linux" &&
+          process.arch === "x64" &&
+          isAbsolute(process.env.REA_PWNTOOLS_PYTHON ?? "")),
+      binaryLayoutEnabled:
+        options.binaryLayout !== undefined ||
+        (process.platform === "linux" &&
+          process.arch === "x64" &&
+          isAbsolute(process.env.REA_PWNTOOLS_PYTHON ?? "")),
       firmwareInspectionEnabled:
         options.firmwareAnalysis !== undefined ||
         (process.platform === "linux" &&
@@ -96,10 +123,6 @@ const installSessionToolAvailability = (
         options.firmwareAnalysis !== undefined ||
         (process.platform === "linux" &&
           isAbsolute(process.env.REA_UNBLOB_COMMAND ?? "")),
-      androidAnalysisEnabled:
-        options.androidAnalysis !== undefined ||
-        ((process.platform === "linux" || process.platform === "darwin") &&
-          isAbsolute(process.env.REA_JADX_MCP_JAR ?? "")),
       browserObservationEnabled: options.browserObservation !== undefined,
       javascriptRecoveryEnabled:
         options.javascriptRecovery !== undefined ||
@@ -120,7 +143,7 @@ const installSessionToolAvailability = (
 };
 
 const createMcpServer = (session: BinarySessionPort | undefined): McpServer =>
-  new McpServer(
+  new EvidenceMcpServer(
     {
       name: PRODUCT_IDENTITY.mcpServerKey,
       version: PRODUCT_IDENTITY.packageVersion,
@@ -132,6 +155,9 @@ const createMcpServer = (session: BinarySessionPort | undefined): McpServer =>
           ? ACTIVE_TARGET_INSTRUCTIONS
           : TARGET_FREE_INSTRUCTIONS,
     },
+    session === undefined
+      ? undefined
+      : (evidence) => session.recordEvidence(evidence),
   );
 
 /**
@@ -147,6 +173,7 @@ export const createServer = (
   const startedAt = new Date().toISOString();
   const logger = options.logger ?? silentLogger;
   const server = createMcpServer(session);
+  const android = options.androidAnalysis ?? createAndroidAnalysisProvider();
   const availability = installSessionToolAvailability(server, session, options);
   const toolLogger = logger.child({ layer: "server" });
   const {
@@ -167,7 +194,6 @@ export const createServer = (
     recordEvidenceWithUnknown,
   };
   registerBinaryAnalysisTools(toolContext);
-  const android = options.androidAnalysis ?? createAndroidAnalysisProvider();
   const previousOnclose = server.server.onclose;
   server.server.onclose = () => {
     previousOnclose?.();
@@ -187,6 +213,25 @@ export const createServer = (
   registerAndroidTools(
     server,
     new AndroidAnalysisService(android),
+    toolLogger,
+    recordEvidence,
+  );
+  registerBinaryDiagnosticsTools(
+    server,
+    options.binaryLayout ?? createBinaryLayoutService(),
+    toolLogger,
+    recordEvidence,
+  );
+  registerAnalysisViewTool(server, toolLogger, evidenceById, recordEvidence);
+  registerEvmTools(
+    server,
+    options.evmInterface ?? createEvmInterfaceService(),
+    toolLogger,
+    recordEvidence,
+  );
+  registerRecordedCrashTools(
+    server,
+    options.recordedCrash ?? createRecordedCrashService(),
     toolLogger,
     recordEvidence,
   );
@@ -238,6 +283,8 @@ export const createServer = (
       ...(availability === undefined
         ? {}
         : { availabilityPolicy: availability.policy }),
+      androidAnalysisAvailability: (signal) =>
+        android.inspectAvailability(signal),
       startedAt,
     });
   }
@@ -251,7 +298,9 @@ const createSessionRecorders = (
   evidenceById:
     session === undefined
       ? undefined
-      : (evidenceId: string) => session.evidenceById(evidenceId),
+      : (evidenceId: string) =>
+          session.evidenceForAnalysis?.(evidenceId) ??
+          session.evidenceById(evidenceId),
   activeTarget:
     session === undefined ? undefined : () => session.activeTarget(),
   recordEvidence:
@@ -306,6 +355,14 @@ const registerBinaryAnalysisTools = ({
     ...analysisOptions,
     analysisProfile:
       session === undefined ? undefined : () => session.analysisProfile(),
+    allowsSnapshotReplay:
+      session === undefined
+        ? undefined
+        : (operation) => session.allowsSnapshotReplay(operation),
+    recordWorkflowSnapshot:
+      session === undefined
+        ? undefined
+        : (input) => session.recordWorkflowSnapshot(input),
   });
   const evidenceOptions = { logger, activeTarget, recordEvidence };
   registerNativeTools(server, analysis, evidenceOptions);

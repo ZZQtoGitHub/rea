@@ -1,3 +1,6 @@
+import { EVM_TOOL_CONTRACTS } from "./evm/evmToolContracts.js";
+import { ANALYSIS_VIEW_TOOL_CONTRACTS } from "./analysisViewToolContracts.js";
+import { BINARY_DIAGNOSTICS_TOOL_CONTRACTS } from "./native/binaryDiagnosticsToolContracts.js";
 import { describe, expect, it } from "vitest";
 
 import { ENHANCED_TOOL_CONTRACTS } from "./enhancedToolContracts.js";
@@ -23,7 +26,10 @@ const GROUPS = {
   official: OFFICIAL_TOOL_CONTRACTS,
   enhanced: ENHANCED_TOOL_CONTRACTS,
   native: NATIVE_TOOL_CONTRACTS,
+  binary_diagnostics: BINARY_DIAGNOSTICS_TOOL_CONTRACTS,
+  analysis_view: ANALYSIS_VIEW_TOOL_CONTRACTS,
   artifact: ARTIFACT_TOOL_CONTRACTS,
+  evm: EVM_TOOL_CONTRACTS,
   managed: MANAGED_TOOL_CONTRACTS,
   android: ANDROID_TOOL_CONTRACTS,
   firmware: FIRMWARE_TOOL_CONTRACTS,
@@ -159,7 +165,6 @@ const PUBLISHED_TOOL_NAME_FLOOR = [
   "set_addresses_names",
   "set_bookmark",
   "set_comment",
-  "set_current_document",
   "set_inline_comment",
   "trace_application_feature",
   "trace_call_path",

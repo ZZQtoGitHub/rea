@@ -37,7 +37,7 @@ const TEST_PROJECTS = [
     name: "adapters",
     include: [
       "src/*.test.ts",
-      "src/{artifacts,browser,dotnet,firmware,ghidra,hopper,ida,inspector,javascript,native,process,reference,server,windows}/**/*.test.ts",
+      "src/{artifacts,browser,dotnet,evm,firmware,ghidra,hopper,ida,inspector,javascript,native,process,reference,server,windows}/**/*.test.ts",
     ],
     pool: "forks" as const,
     maxWorkers: MAX_TEST_WORKERS,
@@ -134,6 +134,7 @@ export default defineConfig({
     projects,
     retry: 0,
     reporters: ["default"],
+    runner: "./tests/processOwnershipRunner.ts",
     // Boundary projects may compete with TypeScript, docs, and package checks
     // under Turbo. Keep the deadline bounded while avoiding false failures from
     // host-level CPU and filesystem contention.

@@ -362,6 +362,97 @@ describe("contextual JavaScript package path resolution", () => {
   });
 });
 
+describe("generic package entry heuristics", () => {
+  it.each([
+    ['{"main":"actual.cjs","module":"bundler.mjs"}', "actual.cjs"],
+    ['{"module":"bundler.mjs"}', "bundler.mjs"],
+  ])(
+    "preserves generic entry heuristics without a module kind for %s",
+    (metadata, entry) => {
+      const files = fileMap([
+        file("app/consumer.js", "root"),
+        file("app/node_modules/fixture/package.json", "root", metadata),
+        file("app/node_modules/fixture/actual.cjs", "root"),
+        file("app/node_modules/fixture/bundler.mjs", "root"),
+        file("app/node_modules/fixture/index.js", "root"),
+      ]);
+      expect(
+        resolve({
+          declaredPath: "fixture",
+          sourcePath: "app/consumer.js",
+          context: "module-specifier",
+          files,
+        }),
+      ).toMatchObject({
+        resolution_status: "resolved",
+        resolved_path: `app/node_modules/fixture/${entry}`,
+      });
+    },
+  );
+});
+
+describe("package exports exact targets", () => {
+  it.each([
+    ["./file", "app/node_modules/fixture/file.js"],
+    ["./folder", "app/node_modules/fixture/folder/index.js"],
+  ])(
+    "resolves exports target %s only to that exact file",
+    (target, nearMiss) => {
+      const files = fileMap([
+        file("app/consumer.js", "root"),
+        file(
+          "app/node_modules/fixture/package.json",
+          "root",
+          JSON.stringify({ exports: target }),
+        ),
+        file(nearMiss, "root"),
+      ]);
+      for (const moduleKind of ["import", "require"] as const) {
+        const resolution = resolve({
+          declaredPath: "fixture",
+          sourcePath: "app/consumer.js",
+          context: "module-specifier",
+          moduleKind,
+          files,
+        });
+        expect(resolution).toMatchObject({
+          resolution_status: "not-found",
+          resolved_path: null,
+        });
+        expect(resolution.limitations.join(" ")).toContain(
+          "exports targets are exact files",
+        );
+      }
+    },
+  );
+
+  it("keeps extension and index fallbacks for a legacy main entry", () => {
+    for (const [main, target] of [
+      ["./file", "app/node_modules/fixture/file.js"],
+      ["./folder", "app/node_modules/fixture/folder/index.js"],
+    ] as const) {
+      const files = fileMap([
+        file("app/consumer.js", "root"),
+        file(
+          "app/node_modules/fixture/package.json",
+          "root",
+          JSON.stringify({ main }),
+        ),
+        file(target, "root"),
+      ]);
+      expect(
+        resolve({
+          declaredPath: "fixture",
+          sourcePath: "app/consumer.js",
+          context: "module-specifier",
+          moduleKind: "require",
+          files,
+        }),
+      ).toMatchObject({ resolution_status: "resolved", resolved_path: target });
+    }
+  });
+});
+
 describe("directory package entrypoint precedence", () => {
   it.each([
     ["require", '{"main":"actual.cjs"}', "actual.cjs"],

@@ -22,6 +22,19 @@ import {
 
 export { SUPPORTED_GHIDRA_JAVA_MAJOR, SUPPORTED_GHIDRA_VERSION };
 
+const NATIVE_PLATFORMS: Readonly<
+  Partial<
+    Record<
+      NodeJS.Platform,
+      Readonly<Partial<Record<NodeJS.Architecture, string>>>
+    >
+  >
+> = {
+  linux: { x64: "linux_x86_64", arm64: "linux_arm_64" },
+  darwin: { x64: "mac_x86_64", arm64: "mac_arm_64" },
+  win32: { x64: "win_x86_64" },
+};
+
 /** Caller-owned paths and host coordinates used for one installation probe. */
 export interface GhidraInstallationOptions {
   readonly installDir?: string;
@@ -228,14 +241,11 @@ const installationCoordinates = (
           "support",
           platform === "win32" ? "analyzeHeadless.bat" : "analyzeHeadless",
         );
-  const decompilerPlatform =
-    platform === "darwin"
-      ? architecture === "arm64"
-        ? "mac_arm_64"
-        : "mac_x86_64"
-      : null;
+  const decompilerPlatform = NATIVE_PLATFORMS[platform]?.[architecture];
+  const decompilerExecutable =
+    platform === "win32" ? "decompile.exe" : "decompile";
   const nativeDecompilerPath =
-    installDir === null || decompilerPlatform === null
+    installDir === null || decompilerPlatform === undefined
       ? null
       : ([
           path.join(
@@ -245,7 +255,7 @@ const installationCoordinates = (
             "Decompiler",
             "os",
             decompilerPlatform,
-            "decompile",
+            decompilerExecutable,
           ),
           path.join(
             installDir,
@@ -255,7 +265,7 @@ const installationCoordinates = (
             "build",
             "os",
             decompilerPlatform,
-            "decompile",
+            decompilerExecutable,
           ),
         ].find((candidate) => host.executable(candidate)) ?? null);
   const properties =
@@ -296,32 +306,21 @@ const installationChecks = ({
   javaHome,
   host,
 }: GhidraInstallationCheckContext): readonly GhidraInstallationCheck[] => [
-  installationCheck({
-    name: "configuration",
-    passed: coordinates.installDir !== null,
-    code: "not_configured",
-    detail: coordinates.installDir ?? "GHIDRA_INSTALL_DIR is not set",
-    remediation: `Set GHIDRA_INSTALL_DIR to an extracted Ghidra ${ghidraReleaseLine()} release directory.`,
-  }),
+  configurationCheck(coordinates.installDir, javaHome, platform),
   installationCheck({
     name: "platform",
-    passed:
-      platform === "linux" || platform === "win32" || platform === "darwin",
+    passed: NATIVE_PLATFORMS[platform] !== undefined,
     code: "unsupported_host",
     detail: platform,
     remediation:
-      "Use Linux or Windows x64, or macOS x64/arm64 with matching native Ghidra tools.",
+      "Use Linux or macOS x64/arm64, or Windows x64 with matching native Ghidra tools.",
   }),
   installationCheck({
     name: "architecture",
-    passed:
-      ((platform === "linux" || platform === "win32") &&
-        architecture === "x64") ||
-      (platform === "darwin" &&
-        (architecture === "x64" || architecture === "arm64")),
+    passed: NATIVE_PLATFORMS[platform]?.[architecture] !== undefined,
     code: "unsupported_host",
     detail: architecture,
-    remediation: "Use x64 on Linux or Windows, or x64/arm64 on macOS.",
+    remediation: "Use x64/arm64 on Linux or macOS, or x64 on Windows.",
   }),
   installationCheck({
     name: "installation",
@@ -346,15 +345,12 @@ const installationChecks = ({
   }),
   installationCheck({
     name: "native_decompiler",
-    passed: platform !== "darwin" || coordinates.nativeDecompilerPath !== null,
+    passed: coordinates.nativeDecompilerPath !== null,
     code: "executable_missing",
     detail:
-      platform !== "darwin"
-        ? "not required on this platform"
-        : (coordinates.nativeDecompilerPath ??
-          "matching macOS native decompiler was not found"),
-    remediation:
-      "REA does not build native tools. Build Ghidra's native components for this macOS architecture or provide an installation containing Ghidra/Features/Decompiler/os/<platform>/decompile.",
+      coordinates.nativeDecompilerPath ??
+      `Matching native decompiler for ${platform}/${architecture} was not found`,
+    remediation: `Provide an executable Ghidra/Features/Decompiler/os/${NATIVE_PLATFORMS[platform]?.[architecture] ?? "<platform>"}/${platform === "win32" ? "decompile.exe" : "decompile"}, or its build/os equivalent. REA does not build or install native tools.`,
   }),
   javaCheck(
     coordinates.java,
@@ -363,6 +359,40 @@ const installationChecks = ({
     coordinates.properties,
   ),
 ];
+
+/**
+ * REA's configuration parser, and so the MCP server and analysis, accept only
+ * absolute paths; a relative one that happens to resolve here must not pass.
+ */
+const configurationCheck = (
+  installDir: string | null,
+  javaHome: string | undefined,
+  platform: NodeJS.Platform,
+): GhidraInstallationCheck => {
+  const { isAbsolute } = platform === "win32" ? win32 : posix;
+  const relative = [
+    ...(installDir !== null && !isAbsolute(installDir)
+      ? ["GHIDRA_INSTALL_DIR"]
+      : []),
+    ...(javaHome !== undefined && !isAbsolute(javaHome) ? ["JAVA_HOME"] : []),
+  ];
+  if (installDir === null || relative.length === 0)
+    return installationCheck({
+      name: "configuration",
+      passed: installDir !== null,
+      code: "not_configured",
+      detail: installDir ?? "GHIDRA_INSTALL_DIR is not set",
+      remediation: `Set GHIDRA_INSTALL_DIR to an extracted Ghidra ${ghidraReleaseLine()} release directory.`,
+    });
+  const settings = relative.join(" and ");
+  return installationCheck({
+    name: "configuration",
+    passed: false,
+    code: "not_configured",
+    detail: `${settings} must be absolute`,
+    remediation: `Set ${settings} to ${relative.length === 1 ? "an absolute path" : "absolute paths"}. REA's analysis and MCP server reject relative paths even when they resolve from the current directory.`,
+  });
+};
 
 /** Project an installation probe into caller-visible, secret-free diagnostics. */
 export const ghidraInstallationDiagnostics = (

@@ -23,7 +23,15 @@ import {
 } from "./LinuxPrivateDisplayProbe.js";
 import writeFileAtomic from "write-file-atomic";
 
-import { acquireHopperTargetLease } from "./HopperTargetLease.js";
+import {
+  prepareHopperMachOImage,
+  type HopperMachOImage,
+} from "./HopperMachOImage.js";
+
+import {
+  acquireHopperTargetLease,
+  acquireLinuxHopperApplicationLease,
+} from "./HopperTargetLease.js";
 import type { HopperTargetLease } from "./HopperTargetLease.js";
 
 const execFileAsync = promisify(execFile);
@@ -39,9 +47,16 @@ export interface BridgeSession {
 
 /** Process handle returned by a bridge launcher. */
 export type BridgeLaunch =
-  | (ProviderProcessLaunch & { readonly shutdownMode: "bridge-request" })
+  | (ProviderProcessLaunch & {
+      readonly shutdownMode: "bridge-request";
+      readonly preparedImagePath?: string;
+      /** The owned helper may hand off to an external GUI application. */
+      readonly providerLifetime: "launcher-process" | "external-application";
+    })
   | (Extract<ProviderProcessLaunch, { readonly ownsProcessLifetime: true }> & {
       readonly shutdownMode: "process-cleanup";
+      readonly preparedImagePath?: string;
+      readonly providerLifetime: "launcher-process";
       readonly cleanup: NonNullable<ProviderProcessLaunch["cleanup"]>;
     });
 
@@ -64,6 +79,10 @@ interface SharedHopperApplicationLauncherOptions {
   readonly targetKind: "executable" | "database";
   readonly loaderArgs: readonly string[];
   readonly bridgeScriptPath: string;
+  readonly preparedImage?: {
+    readonly image: HopperMachOImage;
+    readonly sourceSha256: string;
+  };
 }
 
 /** Explicit launcher contract; the Linux adapter verifies its pinned Hopper build before execution. */
@@ -80,6 +99,7 @@ export type HopperApplicationLauncherOptions =
 export interface HopperApplicationLauncherDependencies {
   readonly platform?: NodeJS.Platform;
   readonly acquireTargetLease?: typeof acquireHopperTargetLease;
+  readonly acquireApplicationLease?: typeof acquireLinuxHopperApplicationLease;
   readonly selectPrivateDisplay?: (options: {
     readonly helperPath: string;
     readonly signal?: AbortSignal;
@@ -115,21 +135,35 @@ export class HopperApplicationLauncher implements BridgeLauncher {
       HopperStartError | HopperCancelledError | HopperProcessError
     >
   > {
-    const leaseResult = await this.#acquireTargetLease(session.runId);
+    const leaseResult = await this.#acquireLaunchLease(session.runId);
     if (!leaseResult.ok) return leaseResult;
     const lease = leaseResult.value;
     let leaseTransferred = false;
     try {
+      let loadedPath = this.options.targetPath;
+      if (this.options.preparedImage !== undefined) {
+        const prepared = await prepareHopperMachOImage(
+          this.options.targetPath,
+          this.options.preparedImage.sourceSha256,
+          this.options.preparedImage.image,
+          join(session.directory, "image.macho"),
+          options.signal,
+        );
+        if (!prepared.ok) return prepared;
+        loadedPath = prepared.value;
+      }
       const ownsProcessLifetime = usesLinuxDemo(this.options);
       const bootstrap = await this.#writeBootstrap(
         session,
         ownsProcessLifetime,
+        loadedPath,
       );
       if (!bootstrap.ok) return bootstrap;
       const launched = await this.#launchPreparedTarget({
         session,
         signal: options.signal,
         bootstrapPath: bootstrap.value,
+        loadedPath,
         ownsProcessLifetime,
         lease,
       });
@@ -144,6 +178,7 @@ export class HopperApplicationLauncher implements BridgeLauncher {
     readonly session: BridgeSession;
     readonly signal: AbortSignal | undefined;
     readonly bootstrapPath: string;
+    readonly loadedPath: string;
     readonly ownsProcessLifetime: boolean;
     readonly lease: HopperTargetLease | undefined;
   }): Promise<
@@ -162,7 +197,7 @@ export class HopperApplicationLauncher implements BridgeLauncher {
       "-Y",
       bootstrapPath,
       action,
-      this.options.targetPath,
+      input.loadedPath,
     ];
     try {
       if (signal?.aborted === true) return err(new HopperCancelledError());
@@ -211,58 +246,87 @@ export class HopperApplicationLauncher implements BridgeLauncher {
         await cleanupOwnedProcessGroup(started.ownership);
         return err(new HopperStartError({ cause }));
       }
-      return ok({
+      const ownedLauncher = {
+        ...(this.options.preparedImage === undefined
+          ? {}
+          : { preparedImagePath: input.loadedPath }),
         process: started.process,
-        ownsProcessLifetime: true,
+        ownsProcessLifetime: true as const,
         ownership: started.ownership,
-        shutdownMode: ownsProcessLifetime
-          ? "process-cleanup"
-          : "bridge-request",
         cleanup,
-      });
+      };
+      return ownsProcessLifetime
+        ? ok({
+            ...ownedLauncher,
+            providerLifetime: "launcher-process",
+            shutdownMode: "process-cleanup",
+          })
+        : ok({
+            ...ownedLauncher,
+            providerLifetime: "external-application",
+            shutdownMode: "bridge-request",
+          });
     } catch (cause: unknown) {
       return err(hopperLaunchFailure(cause, signal));
     }
   }
 
-  async #acquireTargetLease(
+  async #acquireLaunchLease(
     runId: string,
   ): Promise<Result<HopperTargetLease | undefined, HopperStartError>> {
-    if ((this.dependencies.platform ?? process.platform) !== "darwin")
-      return ok(undefined);
+    const platform = this.dependencies.platform ?? process.platform;
+    const applicationLease =
+      platform === "linux" && usesLinuxDemo(this.options);
+    if (!applicationLease && platform !== "darwin") return ok(undefined);
     try {
-      const acquisition = await (
-        this.dependencies.acquireTargetLease ?? acquireHopperTargetLease
-      )({
-        targetPath: this.options.targetPath,
-        targetKind: this.options.targetKind,
-        loaderArgs: this.options.loaderArgs,
-        runId,
-      });
+      const acquisition = applicationLease
+        ? await (
+            this.dependencies.acquireApplicationLease ??
+            acquireLinuxHopperApplicationLease
+          )({ runId })
+        : await (
+            this.dependencies.acquireTargetLease ?? acquireHopperTargetLease
+          )({
+            targetPath: this.options.targetPath,
+            targetKind: this.options.targetKind,
+            loaderArgs: this.options.loaderArgs,
+            runId,
+          });
       if (!acquisition.acquired)
         return err(
           new HopperStartError({
             ownerRunId: acquisition.owner.runId,
-            userMessage:
-              `This Hopper target is already open in REA session ${acquisition.owner.runId}. ` +
-              "Use that REA session or close it before opening this target again.",
+            userMessage: applicationLease
+              ? `Linux Hopper is already active in REA session ${acquisition.owner.runId}; it cannot open ${this.options.targetPath} in another session. This build forwards new launches to the existing application. Use the owning REA session to switch targets, or close it before retrying.`
+              : `This Hopper target is already open in REA session ${acquisition.owner.runId}. ` +
+                "Use that REA session or close it before opening this target again.",
           }),
         );
       return ok(acquisition.lease);
     } catch (cause: unknown) {
-      return err(new HopperStartError({ cause }));
+      return err(
+        cause instanceof HopperStartError
+          ? cause
+          : new HopperStartError({ cause }),
+      );
     }
   }
 
   async #writeBootstrap(
     session: BridgeSession,
     ownsProcessLifetime: boolean,
+    loadedPath: string,
   ): Promise<Result<string, HopperStartError>> {
     const bootstrapPath = `${session.directory}/bootstrap.py`;
     try {
       await writeFile(
         bootstrapPath,
-        bridgeBootstrapSource(session, this.options, ownsProcessLifetime),
+        bridgeBootstrapSource(
+          session,
+          this.options,
+          ownsProcessLifetime,
+          loadedPath,
+        ),
         { encoding: "utf8", mode: 0o600 },
       );
       await chmod(bootstrapPath, 0o600);
@@ -308,12 +372,13 @@ const bridgeBootstrapSource = (
   session: BridgeSession,
   options: SharedHopperApplicationLauncherOptions,
   ownsProcessLifetime: boolean,
+  loadedPath: string,
 ): string =>
   [
     `REA_SOCKET = ${JSON.stringify(session.socketPath)}`,
     `REA_TOKEN = ${JSON.stringify(session.token)}`,
     `REA_RUN_ID = ${JSON.stringify(session.runId)}`,
-    `REA_TARGET_PATH = ${JSON.stringify(options.targetPath)}`,
+    `REA_TARGET_PATH = ${JSON.stringify(loadedPath)}`,
     `REA_OWNS_PROCESS_LIFETIME = ${ownsProcessLifetime ? "True" : "False"}`,
     `exec(compile(open(${JSON.stringify(options.bridgeScriptPath)}, 'rb').read(), ${JSON.stringify(options.bridgeScriptPath)}, 'exec'))`,
     "",

@@ -7,13 +7,14 @@ import { analysisErrorRemediationAction } from "../domain/analysisErrorPresentat
 import { parseBinaryTarget } from "./BinaryTargetResolver.js";
 import { execFileOutput } from "../process/ExecFileOutput.js";
 import type { JsonValue } from "../domain/jsonValue.js";
-import { probeHomebrew } from "./homebrew.js";
+import { installedCaskAppdir, probeHomebrew } from "./homebrew.js";
 import {
   linuxHopperBinarySupported,
   linuxSharedLibrariesAvailable,
   readLinuxDistribution,
   type LinuxDistribution,
 } from "./LinuxHopper.js";
+import { canonicalSkillNeedsInstall } from "./SetupSkill.js";
 import { CATALOG_IDENTITY } from "../catalogIdentity.js";
 import { PRODUCT_IDENTITY, SDK_IDENTITY } from "../identity.js";
 import {
@@ -95,11 +96,13 @@ export interface DoctorHost {
   ilspyCmdVersion?(path: string): Promise<string | undefined>;
 }
 
-/** Parsed identity committed by an installed REA skill. */
+/** Observed skill metadata and comparison with the packaged instruction bundle. */
 interface InstalledSkillIdentity {
   readonly version: string | null;
   readonly toolCount: number | null;
   readonly catalogDigest: string | null;
+  /** Whether all managed instruction and reference files match this package. */
+  readonly canonical: boolean;
 }
 
 /** Structured result returned by the read-only doctor workflow. */
@@ -139,6 +142,7 @@ interface DoctorIdentity {
   readonly skill: {
     readonly installed_version: string | null;
     readonly installed_tool_count: number | null;
+    /** Legacy catalog digest observed in older bundles; current bundles omit it. */
     readonly installed_catalog_digest: string | null;
     readonly state: "aligned" | "stale" | "missing";
     readonly remediation: string | null;
@@ -211,7 +215,7 @@ const collectDoctorIdentity = async (
       ...registrations
         .filter(
           (registration): registration is UnhealthyClientRegistrationStatus =>
-            registration.state !== "aligned",
+            registration.state !== "aligned" && registration.state !== "manual",
         )
         .map(registrationCheck),
     ],
@@ -253,7 +257,7 @@ const skillIdentityAligned = (
 ): boolean =>
   identity?.version === PRODUCT_IDENTITY.skillVersion &&
   identity.toolCount === CATALOG_IDENTITY.counts.mcp_tools &&
-  identity.catalogDigest === CATALOG_IDENTITY.digests.combined_sha256;
+  identity.canonical;
 
 const skillIdentityCheck = (
   identity: InstalledSkillIdentity | undefined,
@@ -376,20 +380,30 @@ export const systemDoctorHost = (
     supportedLinuxHopper: linuxHopperBinarySupported,
     async brewHopperPath() {
       return probeHomebrew(async (command) => {
+        let caskroom: string;
         try {
-          const prefix = (
+          // Without a cask argument, `--caskroom` does not load Homebrew's
+          // cask API, so doctor writes no Homebrew cache files.
+          caskroom = (
             await hostExecFileOutput(
               command,
-              ["--prefix", "--cask", "hopper-disassembler"],
+              ["--caskroom"],
               commandEnvironment,
             )
           ).stdout.trim();
-          return `${prefix}/Hopper Disassembler.app/Contents/MacOS/hopper`;
         } catch (cause: unknown) {
           // best-effort cleanup: optional Homebrew probing; absence means uninstalled.
           void cause;
           return undefined;
         }
+        const appdir = await installedCaskAppdir(
+          caskroom,
+          "hopper-disassembler",
+          homeDirectory,
+        );
+        return appdir === undefined
+          ? undefined
+          : join(appdir, "Hopper Disassembler.app/Contents/MacOS/hopper");
       });
     },
     manualHopperPaths: () => manualHopperPaths(homeDirectory),
@@ -507,6 +521,7 @@ const installedSkillIdentity = async (
     const content = await readInstalledSkill(home);
     const countText = /^\s{2}tool_count:\s*(\d+)\s*$/mu.exec(content)?.[1];
     return {
+      canonical: !(await canonicalSkillNeedsInstall(home)),
       version: /^\s{2}version:\s*"([^"]+)"\s*$/mu.exec(content)?.[1] ?? null,
       toolCount:
         countText === undefined ? null : Number.parseInt(countText, 10),

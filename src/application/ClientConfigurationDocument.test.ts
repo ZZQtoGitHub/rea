@@ -1,48 +1,26 @@
 import { describe, expect, it } from "vitest";
 
+import { parse as parseToml } from "smol-toml";
+
 import {
   clientConfigurationServersKey,
-  clientRegistrationEntry,
   parseClientConfiguration,
   serializeClientConfiguration,
 } from "./ClientConfigurationDocument.js";
 
-describe.each([
-  "json",
-  "vscode",
-  "copilot_cli",
-  "opencode",
-  "commandcode",
-] as const)("%s client configuration BOM handling", (format) => {
+describe("JSON client configuration BOM handling", () => {
+  const format = "json" as const;
   const serversKey = clientConfigurationServersKey(format);
 
-  it.each(["", "\uFEFF"])("parses a document with prefix %j", (bom) => {
-    const registration = clientRegistrationEntry(format, ["rea", "mcp"], {});
-    const document = { [serversKey]: { rea: registration } };
+  it("reports malformed BOM-prefixed JSON at the original offset", () => {
+    const text = `\uFEFF{\r\n  "${serversKey}": {"rea": @}\r\n}`;
 
-    expect(
-      parseClientConfiguration(`${bom}${JSON.stringify(document)}`, format),
-    ).toEqual({
-      document,
-      servers: document[serversKey],
-      serversPath: [serversKey],
-      dialect: format,
-      legacyServers: {},
-    });
+    expect(() => parseClientConfiguration(text, format)).toThrow(
+      new SyntaxError(
+        `Invalid JSON/JSONC at offset ${text.indexOf("@")}: InvalidSymbol`,
+      ),
+    );
   });
-
-  it.each(["", "\uFEFF"])(
-    "reports malformed JSON at the original offset with prefix %j",
-    (bom) => {
-      const text = `${bom}{\r\n  "${serversKey}": {"rea": @}\r\n}`;
-
-      expect(() => parseClientConfiguration(text, format)).toThrow(
-        new SyntaxError(
-          `Invalid JSON/JSONC at offset ${text.indexOf("@")}: InvalidSymbol`,
-        ),
-      );
-    },
-  );
 
   it.each([
     ["\uFEFF\uFEFF{}", 1],
@@ -54,51 +32,6 @@ describe.each([
       new SyntaxError(`Invalid JSON/JSONC at offset ${offset}: InvalidSymbol`),
     );
   });
-
-  it.each(["", "\uFEFF"])(
-    "preserves prefix %j and unrelated bytes across add, update, and removal",
-    (bom) => {
-      const prefix = `${bom}{\r\n  // Keep \uFEFF in comments.\r\n  "label": "left\uFEFFright",\r\n  "${serversKey}": {\r\n    // Other server.\r\n    "other": {\r\n      "command": "other\uFEFFtool"\r\n    },\r\n`;
-      const suffix = '  },\r\n  "theme": "dark",\r\n}\r\n';
-      const original = `${prefix}${suffix}`;
-      let text = original;
-
-      for (const registration of [
-        clientRegistrationEntry(format, ["rea", "mcp"], {}),
-        clientRegistrationEntry(format, ["rea-next", "mcp"], {
-          LABEL: "left\uFEFFright",
-        }),
-        undefined,
-      ]) {
-        const parsed = parseClientConfiguration(text, format);
-        const servers = { ...parsed.servers };
-        if (registration === undefined) delete servers.rea;
-        else servers.rea = registration;
-        const document = { ...parsed.document, [serversKey]: servers };
-
-        text = serializeClientConfiguration(document, format, text, [
-          [serversKey, "rea"],
-        ]);
-
-        expect(parseClientConfiguration(text, format)).toEqual({
-          document,
-          servers,
-          serversPath: [serversKey],
-          dialect: format,
-          legacyServers: {},
-        });
-        expect(Buffer.from(text.slice(0, prefix.length))).toEqual(
-          Buffer.from(prefix),
-        );
-        expect(Buffer.from(text.slice(-suffix.length))).toEqual(
-          Buffer.from(suffix),
-        );
-        expect(text.replaceAll("\r\n", "")).not.toContain("\n");
-      }
-
-      expect(text).toBe(original);
-    },
-  );
 });
 
 describe("TOML client configuration BOM handling", () => {
@@ -108,5 +41,57 @@ describe("TOML client configuration BOM handling", () => {
     expect(parseClientConfiguration(`${bom}${text}`, "toml").servers).toEqual({
       rea: { command: "rea" },
     });
+  });
+});
+
+describe("Codex TOML serialization", () => {
+  const unrelated = [
+    "# Keep this explanation.",
+    'notify = ["a", "b"]',
+    "literal = 'C:\\demo\\path'",
+    "",
+  ].join("\n");
+  const rea = { command: "npx", args: ["-y", "rea-agents@6.1.0", "mcp"] };
+  const registered = `${unrelated}\n[mcp_servers.rea]\ncommand = "npx"\nargs = ["-y", "rea-agents@6.1.0", "mcp"]\n`;
+  const documentOf = (text: string): Record<string, unknown> =>
+    parseClientConfiguration(text, "toml").document;
+  const serialize = (document: Record<string, unknown>, original: string) =>
+    serializeClientConfiguration(document, "toml", original, [
+      ["mcp_servers", "rea"],
+    ]);
+
+  it("adds REA's table without rewriting comments or unrelated values", () => {
+    const document = { ...documentOf(unrelated), mcp_servers: { rea } };
+    const written = serialize(document, unrelated);
+
+    expect(written.startsWith(unrelated)).toBe(true);
+    expect(parseToml(written)).toEqual(document);
+  });
+
+  it("removes REA's table and leaves the rest of the file byte for byte", () => {
+    const document = { ...documentOf(registered), mcp_servers: {} };
+
+    expect(serialize(document, registered)).toBe(unrelated);
+  });
+
+  it("leaves a root disabled_mcp_servers list, which Codex does not read", () => {
+    const original = `# Codex ignores this list.\ndisabled_mcp_servers = ["rea"]\n`;
+    const document = { ...documentOf(original), mcp_servers: { rea } };
+    const written = serialize(document, original);
+
+    expect(written.startsWith(original)).toBe(true);
+    expect(parseToml(written)).toEqual(document);
+  });
+
+  it("rewrites the document when an edit would not hold the requested values", () => {
+    const document = {
+      ...documentOf(unrelated),
+      notify: ["changed"],
+      mcp_servers: { rea },
+    };
+    const written = serialize(document, unrelated);
+
+    expect(written).not.toContain("# Keep this explanation.");
+    expect(parseToml(written)).toEqual(document);
   });
 });

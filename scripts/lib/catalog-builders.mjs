@@ -16,12 +16,18 @@ export const toolFamilyCatalog = (sources) => {
     {
       id: "native",
       surface: "native-provider",
-      contracts: sources.nativeContracts.NATIVE_TOOL_CONTRACTS,
+      contracts: [
+        ...sources.nativeContracts.NATIVE_TOOL_CONTRACTS,
+        ...sources.binaryDiagnosticsContracts.BINARY_DIAGNOSTICS_TOOL_CONTRACTS,
+      ],
     },
     {
       id: "artifact",
       surface: "artifact-provider",
-      contracts: sources.artifactContracts.ARTIFACT_TOOL_CONTRACTS,
+      contracts: [
+        ...sources.artifactContracts.ARTIFACT_TOOL_CONTRACTS,
+        ...sources.evmContracts.EVM_TOOL_CONTRACTS,
+      ],
     },
     {
       id: "managed",
@@ -69,6 +75,7 @@ export const toolFamilyCatalog = (sources) => {
       surface: "application-workflow",
       contracts: [
         ...sources.applicationContracts.APPLICATION_TOOL_CONTRACTS,
+        ...sources.analysisViewContracts.ANALYSIS_VIEW_TOOL_CONTRACTS,
         ...sources.webScriptContracts.WEB_SCRIPT_TOOL_CONTRACTS,
         ...sources.javascriptRecoveryContracts
           .JAVASCRIPT_RECOVERY_TOOL_CONTRACTS,
@@ -142,6 +149,15 @@ export const providerCatalog = (sources) => {
     {
       identity: sources.nativeProvider.NATIVE_MACOS_PROVIDER_IDENTITY,
       contracts: sources.nativeContracts.NATIVE_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.pwntoolsProvider.PWNTOOLS_PROVIDER_IDENTITY,
+      contracts:
+        sources.binaryDiagnosticsContracts.BINARY_DIAGNOSTICS_TOOL_CONTRACTS,
+    },
+    {
+      identity: sources.evmProvider.EVMOLE_PROVIDER_IDENTITY,
+      contracts: sources.evmContracts.EVM_TOOL_CONTRACTS,
     },
     {
       identity: sources.artifactProviders.ARTIFACT_GRAPH_PROVIDER,
@@ -230,6 +246,10 @@ export const providerCatalog = (sources) => {
           name !== "project_android_application_graph" &&
           name !== "project_apple_application_graph",
       ),
+    },
+    {
+      identity: sources.artifactProviders.ANALYSIS_VIEW_PROVIDER,
+      contracts: sources.analysisViewContracts.ANALYSIS_VIEW_TOOL_CONTRACTS,
     },
     {
       identity: sources.artifactProviders.ANDROID_APPLICATION_PROVIDER,

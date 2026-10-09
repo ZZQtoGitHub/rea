@@ -14,6 +14,7 @@ import {
 } from "../contracts/toolOutputSchemaPrimitives.js";
 import type { ToolKind } from "../contracts/toolContractTypes.js";
 import type { JsonValue } from "../domain/jsonValue.js";
+import type { ProviderAvailability } from "./AnalysisProvider.js";
 import { TOOL_CONTRACTS } from "../contracts/toolContracts.js";
 import {
   clientRequirementsFor,
@@ -31,11 +32,14 @@ type ToolAvailabilityReason = "available" | ToolUnavailabilityReason;
 
 type ProviderDescriptor = ProviderCapability;
 export type AvailabilityPolicy = {
+  readonly evmInterfaceEnabled?: boolean;
   readonly processCaptureEnabled: boolean;
   readonly optionalProviderLoadFailures?: OptionalProviderLoadFailures;
+  readonly binaryLayoutEnabled?: boolean;
+  readonly recordedCrashEnabled?: boolean;
   readonly firmwareInspectionEnabled?: boolean;
   readonly firmwareExtractionEnabled?: boolean;
-  readonly androidAnalysisEnabled?: boolean;
+  readonly androidAnalysisAvailability?: ProviderAvailability;
   readonly javascriptRecoveryEnabled?: boolean;
   readonly webModuleResolutionEnabled?: boolean;
   readonly browserObservationEnabled?: boolean;
@@ -74,6 +78,7 @@ type AvailabilityContext = {
     | "archive"
     | "artifact"
     | undefined;
+  readonly targetFormat: string | undefined;
   readonly descriptors: ReadonlyMap<string, ProviderDescriptor>;
   readonly policy: AvailabilityPolicy;
 };
@@ -108,6 +113,23 @@ const ENHANCED_REQUIREMENTS: Readonly<Record<string, readonly string[]>> = {
   ],
 };
 
+/** Contract kinds whose operations run on the active session target. */
+const ACTIVE_TARGET_KINDS: ReadonlySet<ToolKind> = new Set([
+  "official-proxy",
+  "enhanced",
+  "native-provider",
+  "artifact-provider",
+]);
+
+/** Native contracts defined only for an active Mach-O executable. */
+const MACHO_TARGET_OPERATIONS: ReadonlySet<string> = new Set([
+  "inspect_macho",
+  "list_architectures",
+  "observe_native_calls",
+  "observe_native_ui",
+  "capture_native_ui_scenario",
+]);
+
 const NAVIGATION_CONTEXT_MODES = [
   {
     name: "current_selection",
@@ -139,6 +161,7 @@ export const buildCapabilityInventory = (
       kind: contract.kind,
       targetOpen: status.open,
       targetKind: status.kind,
+      targetFormat: status.format,
       descriptors,
       policy,
     });
@@ -207,6 +230,8 @@ const availabilityFor = (context: AvailabilityContext): Availability => {
     };
   const workflowAvailability = workflowAvailabilityFor(context);
   if (workflowAvailability !== null) return workflowAvailability;
+  const hostDecision = hostAvailability(context);
+  if (hostDecision !== null) return hostDecision;
   const targetDecision = targetAvailability(context);
   if (targetDecision !== null) return targetDecision;
   return providerAvailability(context);
@@ -280,6 +305,30 @@ const workflowAvailabilityFor = ({
           remediation:
             "On Linux x64, provide an absolute REA_WAKARU_COMMAND for Wakaru 1.13.0 and util-linux prlimit. No binary target is required.",
         };
+  if (name === "inspect_binary_layout")
+    return policy.binaryLayoutEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "On Linux x64, set absolute REA_PWNTOOLS_PYTHON to caller-supplied Python with pwntools 4.15.0. No active binary target is required.",
+        };
+  if (name === "inspect_evm_interface")
+    return policy.evmInterfaceEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "The bundled offline EVM interface profile is currently real-verified on Linux x64. No active binary target or chain endpoint is required.",
+        };
+  if (name === "inspect_recorded_crash")
+    return policy.recordedCrashEnabled === true
+      ? { reason: "available", remediation: null }
+      : {
+          reason: "provider_missing",
+          remediation:
+            "On Linux x64, set absolute REA_PWNTOOLS_PYTHON to caller-supplied Python with pwntools 4.15.0. No active binary target is required.",
+        };
   if (kind === "firmware-provider") {
     const enabled =
       name === "inspect_firmware_regions"
@@ -294,12 +343,16 @@ const workflowAvailabilityFor = ({
         };
   }
   if (kind === "android-provider")
-    return policy.androidAnalysisEnabled === true
+    return policy.androidAnalysisAvailability?.status === "available"
       ? { reason: "available", remediation: null }
       : {
-          reason: "provider_missing",
+          reason:
+            policy.androidAnalysisAvailability?.code === "unsupported_host"
+              ? "unsupported_host"
+              : "provider_missing",
           remediation:
-            "Set REA_JADX_MCP_JAR to a caller-supplied jadx-headless-mcp 0.7.1 JAR and provide Java on Linux or macOS. Only Linux has real-provider verification.",
+            policy.androidAnalysisAvailability?.reason ??
+            "Set REA_JADX_MCP_JAR to a caller-supplied jadx-headless-mcp 0.7.1 JAR and provide a full JDK on Linux or macOS.",
         };
   const browser = browserProviderAvailability(name, kind, policy);
   if (browser !== null) return browser;
@@ -369,12 +422,32 @@ const browserProviderAvailability = (
       };
 };
 
+/**
+ * Opening another target cannot make an operation run on an unsupported host.
+ * Composed operations are decided by their requirements, which another
+ * provider may satisfy.
+ */
+const hostAvailability = ({
+  descriptors,
+  kind,
+  name,
+}: AvailabilityContext): Availability | null => {
+  if (kind === "enhanced") return null;
+  const descriptor = descriptors.get(name);
+  return descriptor?.available === false &&
+    descriptor.availability_code === "unsupported_host"
+    ? { reason: "unsupported_host", remediation: descriptor.reason }
+    : null;
+};
+
 const targetAvailability = ({
+  name,
   kind,
   targetKind,
+  targetFormat,
   targetOpen,
 }: AvailabilityContext): Availability | null => {
-  if (!targetOpen && (kind === "official-proxy" || kind === "enhanced"))
+  if (!targetOpen && ACTIVE_TARGET_KINDS.has(kind))
     return {
       reason: "target_required",
       remediation: "Call open_binary with a supported local target.",
@@ -389,6 +462,16 @@ const targetAvailability = ({
       reason: "target_unsupported",
       remediation:
         "Inventory or extract a native executable, then call open_binary on that executable.",
+    };
+  if (
+    targetOpen &&
+    MACHO_TARGET_OPERATIONS.has(name) &&
+    (targetKind !== "executable" || targetFormat !== "mach-o")
+  )
+    return {
+      reason: "target_unsupported",
+      remediation:
+        "Call open_binary with a Mach-O executable or an app bundle whose main executable is Mach-O.",
     };
   return null;
 };
@@ -412,14 +495,6 @@ const providerAvailability = ({
       reason: "provider_missing",
       remediation:
         "Install or configure a provider that declares this operation.",
-    };
-  if (
-    !descriptor.available &&
-    descriptor.availability_code === "unsupported_host"
-  )
-    return {
-      reason: "unsupported_host",
-      remediation: descriptor.reason,
     };
   return descriptor.available
     ? { reason: "available", remediation: null }

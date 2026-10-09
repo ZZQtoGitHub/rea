@@ -43,6 +43,7 @@ import {
 } from "./verify-real-ghidra-function.mjs";
 const exec = promisify(execFile);
 const verifierRun = createVerifierRun();
+let report;
 const installDir = process.env.GHIDRA_INSTALL_DIR;
 if (installDir === undefined || !isAbsolute(installDir))
   throw new Error(
@@ -265,44 +266,45 @@ try {
   const customPath = process.env.GHIDRA_TARGET_PATH;
   const custom =
     customPath === undefined ? null : await verifyTarget(customPath, "custom");
-  process.stdout.write(
-    `${JSON.stringify({
-      verifier_run: await completeVerifierRun(verifierRun),
-      ok: true,
-      provider: { id: "ghidra", version: SUPPORTED_GHIDRA_VERSION },
-      verification_lane: aarch64JumpTableOnly
-        ? "aarch64-jump-table"
-        : crossFormat
-          ? "cross-format"
-          : "host-native",
-      fixture_sources:
-        crossFormat || aarch64JumpTableOnly
-          ? [sourcePath, crossFormatSourcePath]
-          : [sourcePath],
-      fixtures: [debug, stripped, layout, ...crossResults].map(summary),
-      malformed_target: "rejected-before-provider-start",
-      native_api_cli: aarch64JumpTableOnly
-        ? (crossResults[0]?.native_api_cli ?? null)
-        : debug.native_api_cli,
-      native_value_e2e: debug.native_values,
-      custom_target: custom === null ? null : summary(custom),
-      cleanup: "complete",
-    })}\n`,
-  );
+  report = {
+    ok: true,
+    provider: { id: "ghidra", version: SUPPORTED_GHIDRA_VERSION },
+    verification_lane: aarch64JumpTableOnly
+      ? "aarch64-jump-table"
+      : crossFormat
+        ? "cross-format"
+        : "host-native",
+    fixture_sources:
+      crossFormat || aarch64JumpTableOnly
+        ? [sourcePath, crossFormatSourcePath]
+        : [sourcePath],
+    fixtures: [debug, stripped, layout, ...crossResults].map(summary),
+    malformed_target: "rejected-before-provider-start",
+    native_api_cli: aarch64JumpTableOnly
+      ? (crossResults[0]?.native_api_cli ?? null)
+      : debug.native_api_cli,
+    native_value_e2e: debug.native_values,
+    custom_target: custom === null ? null : summary(custom),
+    cleanup: "complete",
+  };
 } finally {
   await rm(fixtureRoot, { recursive: true, force: true });
 }
+process.stdout.write(
+  `${JSON.stringify({ verifier_run: await completeVerifierRun(verifierRun), ...report })}\n`,
+);
 
 function nativeFixtureTarget(platform, architecture) {
   const supportedTargets = {
     "darwin-arm64": { format: "mach-o", architecture: "arm64" },
     "darwin-x64": { format: "mach-o", architecture: "x86_64" },
     "linux-x64": { format: "elf", architecture: "x86_64" },
+    "linux-arm64": { format: "elf", architecture: "arm64" },
   };
   const target = supportedTargets[`${platform}-${architecture}`];
   if (target === undefined)
     throw new Error(
-      `The Ghidra verifier does not support a host-native fixture on ${platform}/${architecture}; use a supported Linux x64 or macOS x64/arm64 host.`,
+      `The Ghidra verifier does not support a host-native fixture on ${platform}/${architecture}; use a supported Linux or macOS x64/arm64 host.`,
     );
   return target;
 }

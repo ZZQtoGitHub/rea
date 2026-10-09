@@ -3,12 +3,14 @@ import type {
   JavaScriptSemanticBinding,
   JavaScriptSemanticValue,
 } from "../../domain/javascript/javascriptSemanticIr.js";
+import { createJavaScriptSemanticGraphUnknown } from "../../domain/javascript/javascriptSemanticGraph.js";
 import {
-  addSemanticGraphNode,
+  retainSemanticGraphNode,
   addSemanticGraphRelation,
-  constructSemanticGraphNode,
+  addSemanticGraphUnknown,
 } from "./JavaScriptSemanticGraphConstruction.js";
 import type { SemanticFlowProjectionContext } from "./JavaScriptSemanticGraphFlowProjection.js";
+import { observedSemanticEvidence } from "./JavaScriptSemanticGraphEvidence.js";
 
 /** Project bounded literal values and object slots for exact query seeds. */
 export const projectSemanticValues = (
@@ -77,6 +79,29 @@ const projectValue = (input: ValueProjectionInput): void => {
         role: `property:${property.name}`,
       });
     }
+  else if (value.status === "unknown" && value.resourceLimit !== undefined) {
+    const location = binding.definitions[0]?.location ?? null;
+    const evidence = observedSemanticEvidence(context.file, location);
+    const isPropertyValue = role.startsWith("property:");
+    addSemanticGraphUnknown(
+      context.state,
+      createJavaScriptSemanticGraphUnknown({
+        node_id: target.node_id,
+        family: isPropertyValue ? "object-flow" : "data-flow",
+        relation_kinds: [isPropertyValue ? "writes-property" : "defines"],
+        reason: "resource-limit",
+        detail: `${value.reason} Unknown value at ${role}.`,
+        candidate_node_ids: [target.node_id],
+        evidence: {
+          ...evidence,
+          authority: "unknown",
+          state: "unknown",
+          confidence: "unknown",
+          limitations: [value.reason],
+        },
+      }),
+    );
+  }
 };
 
 const addLiteralNode = (
@@ -85,22 +110,15 @@ const addLiteralNode = (
   value: string | number | boolean | null,
   role: string,
 ) =>
-  addSemanticGraphNode(
-    context.state,
-    constructSemanticGraphNode(
-      context.file,
-      {
-        kind: "literal",
-        roleKey: `literal:${binding.bindingId}:${role}:${JSON.stringify(value)}`,
-        location: binding.definitions[0]?.location ?? null,
-        label: JSON.stringify(value),
-        functionNodeId:
-          context.bindingNodes.get(binding.bindingId)?.function_node_id ?? null,
-        properties: { value },
-      },
-      context.state,
-    ),
-  );
+  retainSemanticGraphNode(context.state, context.file, {
+    kind: "literal",
+    roleKey: `literal:${binding.bindingId}:${role}:${JSON.stringify(value)}`,
+    location: binding.definitions[0]?.location ?? null,
+    label: JSON.stringify(value),
+    functionNodeId:
+      context.bindingNodes.get(binding.bindingId)?.function_node_id ?? null,
+    properties: { value },
+  });
 
 /** Create one canonical property slot for a binding/property identity. */
 export const semanticPropertySlot = (
@@ -108,22 +126,15 @@ export const semanticPropertySlot = (
   objectBindingId: string,
   name: string,
 ) =>
-  addSemanticGraphNode(
-    context.state,
-    constructSemanticGraphNode(
-      context.file,
-      {
-        kind: "property-slot",
-        roleKey: `property:${objectBindingId}:${name}`,
-        location: null,
-        label: name,
-        functionNodeId:
-          context.bindingNodes.get(objectBindingId)?.function_node_id ?? null,
-        properties: {
-          name,
-          object_binding_id: objectBindingId,
-        } satisfies Readonly<Record<string, JsonValue>>,
-      },
-      context.state,
-    ),
-  );
+  retainSemanticGraphNode(context.state, context.file, {
+    kind: "property-slot",
+    roleKey: `property:${objectBindingId}:${name}`,
+    location: null,
+    label: name,
+    functionNodeId:
+      context.bindingNodes.get(objectBindingId)?.function_node_id ?? null,
+    properties: {
+      name,
+      object_binding_id: objectBindingId,
+    } satisfies Readonly<Record<string, JsonValue>>,
+  });

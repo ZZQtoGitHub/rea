@@ -21,7 +21,7 @@ const executableAvailable = (path: string): boolean => {
   }
 };
 
-export const defaultHopperLauncherPath = (
+const defaultHopperLauncherPath = (
   platform: NodeJS.Platform = process.platform,
   homeDirectory: string = homedir(),
   executable: (path: string) => boolean = executableAvailable,
@@ -53,6 +53,7 @@ export const parseConfig = (
       : { idaMcpConfigPath: env.REA_IDA_MCP_CONFIG }),
     ghidraInstallDir: env.GHIDRA_INSTALL_DIR,
     ghidraJavaHome: env.JAVA_HOME,
+    ghidraStartupTimeoutMs: env.REA_GHIDRA_STARTUP_TIMEOUT_MS,
     ...(env.REA_GHIDRA_NATIVEAOT_JAR === undefined
       ? {}
       : { ghidraNativeAotJar: env.REA_GHIDRA_NATIVEAOT_JAR }),

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { projectGhidraDoctorInspection } from "./GhidraDoctor.js";
 import {
   ghidraJavaEnvironment,
   inspectGhidraInstallation,
@@ -12,10 +13,12 @@ import {
 const INSTALL = "/opt/ghidra";
 const PROPERTIES = `${INSTALL}/Ghidra/application.properties`;
 const HEADLESS = `${INSTALL}/support/analyzeHeadless`;
+const LINUX_DECOMPILER = `${INSTALL}/Ghidra/Features/Decompiler/os/linux_x86_64/decompile`;
 const MAC_DECOMPILER = `${INSTALL}/Ghidra/Features/Decompiler/os/mac_arm_64/decompile`;
 const WINDOWS_INSTALL = "C:\\tools\\ghidra_12.1.4_PUBLIC";
 const WINDOWS_PROPERTIES = `${WINDOWS_INSTALL}\\Ghidra\\application.properties`;
 const WINDOWS_HEADLESS = `${WINDOWS_INSTALL}\\support\\analyzeHeadless.bat`;
+const WINDOWS_DECOMPILER = `${WINDOWS_INSTALL}\\Ghidra\\Features\\Decompiler\\os\\win_x86_64\\decompile.exe`;
 const JAVA: GhidraJavaObservation = {
   version: "21.0.11",
   major: SUPPORTED_GHIDRA_JAVA_MAJOR,
@@ -31,7 +34,8 @@ const host = (
     path === PROPERTIES
       ? `application.version=${SUPPORTED_GHIDRA_VERSION}\n`
       : undefined,
-  executable: (path) => path === HEADLESS || path === MAC_DECOMPILER,
+  executable: (path) =>
+    path === HEADLESS || path === MAC_DECOMPILER || path === LINUX_DECOMPILER,
   probeJava: () => JAVA,
   ...overrides,
 });
@@ -108,28 +112,29 @@ describe("Ghidra installation inspection", () => {
     },
   );
 
-  it.each(["x64", "arm64"] as const)(
-    "accepts macOS %s with matching native tools",
-    (architecture) => {
-      const decompiler = `${INSTALL}/Ghidra/Features/Decompiler/os/${architecture === "arm64" ? "mac_arm_64" : "mac_x86_64"}/decompile`;
-      const macHost: GhidraInstallationHost = {
-        ...host({
-          platform: "darwin",
+  it.each([
+    ["darwin", "x64", "mac_x86_64"],
+    ["darwin", "arm64", "mac_arm_64"],
+    ["linux", "arm64", "linux_arm_64"],
+  ] as const)(
+    "accepts %s/%s with the matching distribution or locally built native tool",
+    (platform, architecture, nativeDirectory) => {
+      for (const location of ["os", "build/os"]) {
+        const decompiler = `${INSTALL}/Ghidra/Features/Decompiler/${location}/${nativeDirectory}/decompile`;
+        expect(
+          inspectGhidraInstallation(
+            { installDir: INSTALL, platform, architecture },
+            host({
+              executable: (path) => path === HEADLESS || path === decompiler,
+            }),
+          ),
+        ).toMatchObject({
+          status: "available",
+          platform,
           architecture,
-          executable: (path) => path === HEADLESS || path === decompiler,
-        }),
-      };
-      expect(
-        inspectGhidraInstallation(
-          { installDir: INSTALL, platform: "darwin", architecture },
-          macHost,
-        ),
-      ).toMatchObject({
-        status: "available",
-        platform: "darwin",
-        architecture,
-        nativeDecompilerPath: decompiler,
-      });
+          nativeDecompilerPath: decompiler,
+        });
+      }
     },
   );
 
@@ -141,7 +146,8 @@ describe("Ghidra installation inspection", () => {
         path === WINDOWS_PROPERTIES
           ? `application.version=${SUPPORTED_GHIDRA_VERSION}\n`
           : undefined,
-      executable: (path) => path === WINDOWS_HEADLESS,
+      executable: (path) =>
+        path === WINDOWS_HEADLESS || path === WINDOWS_DECOMPILER,
       probeJava: (command, environment) => {
         expect(command).toBe("C:\\Java\\jdk-21\\bin\\java.exe");
         expect(environment.PATH).toMatch(/^C:\\Java\\jdk-21\\bin;/u);
@@ -198,7 +204,7 @@ describe("Ghidra installation rejection diagnostics", () => {
       options: {
         installDir: INSTALL,
         platform: "linux" as const,
-        architecture: "arm64" as const,
+        architecture: "arm" as const,
       },
       override: {},
       failed: "architecture",
@@ -235,6 +241,17 @@ describe("Ghidra installation rejection diagnostics", () => {
       },
       override: { executable: () => false },
       failed: "headless",
+      code: "executable_missing",
+    },
+    {
+      name: "only a foreign-architecture decompiler on Linux arm64",
+      options: {
+        installDir: INSTALL,
+        platform: "linux" as const,
+        architecture: "arm64" as const,
+      },
+      override: {},
+      failed: "native_decompiler",
       code: "executable_missing",
     },
     {
@@ -360,5 +377,49 @@ describe("Ghidra release line and JDK bounds", () => {
         }),
       ),
     ).toMatchObject({ status: "available", javaVersion: "17.0.20.1" });
+  });
+});
+
+describe("Ghidra configuration paths", () => {
+  it.each([
+    [{ installDir: "./ghidra" }, "GHIDRA_INSTALL_DIR must be absolute"],
+    [{ installDir: INSTALL, javaHome: "./jdk" }, "JAVA_HOME must be absolute"],
+    [
+      { installDir: "ghidra", javaHome: "jdk" },
+      "GHIDRA_INSTALL_DIR and JAVA_HOME must be absolute",
+    ],
+  ])(
+    "rejects relative paths that REA's configuration parser rejects (%o)",
+    (paths, detail) => {
+      const result = inspectGhidraInstallation(
+        { ...paths, platform: "linux", architecture: "x64" },
+        host(),
+      );
+      expect(result).toMatchObject({
+        status: "unavailable",
+        rejection: {
+          code: "not_configured",
+          reason: expect.stringContaining("reject relative paths"),
+        },
+      });
+      expect(result.checks).toContainEqual(
+        expect.objectContaining({ name: "configuration", detail }),
+      );
+      // Setup registers only an available inspection's environment.
+      expect(projectGhidraDoctorInspection(result)).toMatchObject({
+        available: false,
+        registrationEnvironment: {},
+      });
+    },
+  );
+
+  it("judges absolute paths by the inspected platform", () => {
+    const result = inspectGhidraInstallation(
+      { installDir: "C:\\ghidra", platform: "win32", architecture: "x64" },
+      host(),
+    );
+    expect(result.checks).toContainEqual(
+      expect.objectContaining({ name: "configuration", status: "passed" }),
+    );
   });
 });

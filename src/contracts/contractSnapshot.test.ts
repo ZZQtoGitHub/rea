@@ -1,3 +1,6 @@
+import { EVM_TOOL_CONTRACTS } from "./evm/evmToolContracts.js";
+import { ANALYSIS_VIEW_TOOL_CONTRACTS } from "./analysisViewToolContracts.js";
+import { BINARY_DIAGNOSTICS_TOOL_CONTRACTS } from "./native/binaryDiagnosticsToolContracts.js";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 
@@ -69,7 +72,10 @@ describe("tool contract surface", () => {
       ...OFFICIAL_TOOL_CONTRACTS,
       ...ENHANCED_TOOL_CONTRACTS,
       ...NATIVE_TOOL_CONTRACTS,
+      ...BINARY_DIAGNOSTICS_TOOL_CONTRACTS,
+      ...ANALYSIS_VIEW_TOOL_CONTRACTS,
       ...ARTIFACT_TOOL_CONTRACTS,
+      ...EVM_TOOL_CONTRACTS,
       ...ANDROID_TOOL_CONTRACTS,
       ...FIRMWARE_TOOL_CONTRACTS,
       ...MANAGED_TOOL_CONTRACTS,

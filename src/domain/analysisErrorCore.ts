@@ -1,5 +1,41 @@
 import type { JsonValue } from "./jsonValue.js";
-import { AnalysisError } from "./analysisErrorBase.js";
+import {
+  AnalysisError,
+  type AnalysisErrorOptions,
+} from "./analysisErrorBase.js";
+
+/** A readable supplied artifact lies outside this operation's supported target formats. */
+export class AnalysisUnsupportedTargetError extends AnalysisError {
+  readonly _tag = "AnalysisUnsupportedTargetError";
+  /** Refusal-specific recovery, when the producer knows an available workflow. */
+  readonly remediationAction: string | undefined;
+  constructor(
+    readonly operation: string,
+    readonly path: string,
+    readonly reason: string,
+    options?: AnalysisErrorOptions & { readonly remediationAction?: string },
+  ) {
+    super(`Unsupported target for ${operation} at ${path}: ${reason}`, options);
+    this.remediationAction = options?.remediationAction;
+  }
+}
+
+/** An analysis or transport resource failure, distinct from malformed input or unsupported coverage. */
+export class AnalysisResourceConstraintError extends AnalysisError {
+  readonly _tag = "AnalysisResourceConstraintError";
+  readonly remediationAction: string | undefined;
+
+  constructor(
+    readonly operation: string,
+    readonly resource: "memory" | "cpu" | "file-size" | "transport",
+    readonly reason: string,
+    readonly reportedLimits: Readonly<Record<string, JsonValue>> | null,
+    options?: AnalysisErrorOptions & { readonly remediationAction?: string },
+  ) {
+    super(`Resource constraint during ${operation}: ${reason}`, options);
+    this.remediationAction = options?.remediationAction;
+  }
+}
 
 /** Provider-neutral invalid analysis input or output at an application boundary. */
 export class AnalysisProtocolError extends AnalysisError {
@@ -12,7 +48,7 @@ export class AnalysisInputError extends AnalysisError {
 
   constructor(
     readonly operation: string,
-    options?: ErrorOptions,
+    options?: AnalysisErrorOptions,
     readonly issues: readonly AnalysisInputIssue[] = [],
   ) {
     super(`Invalid analysis input for ${operation}`, options);
@@ -43,7 +79,7 @@ export class AnalysisOutputError extends AnalysisError {
   constructor(
     readonly operation: string,
     readonly reason: string,
-    options?: ErrorOptions,
+    options?: AnalysisErrorOptions,
   ) {
     super(`Invalid analysis output for ${operation}: ${reason}`, options);
   }
@@ -58,7 +94,7 @@ export class AnalysisCapabilityUnavailableError extends AnalysisError {
     readonly providerId: string,
     readonly operation: string,
     readonly reason: string,
-    options?: ErrorOptions & { readonly userMessage?: string },
+    options?: AnalysisErrorOptions & { readonly userMessage?: string },
   ) {
     super(
       `Provider ${providerId} cannot execute ${operation}: ${reason}`,
@@ -72,8 +108,11 @@ export class AnalysisCapabilityUnavailableError extends AnalysisError {
 export class AnalysisCancelledError extends AnalysisError {
   readonly _tag = "AnalysisCancelledError";
 
-  constructor(readonly operation: string) {
-    super(`Analysis operation was cancelled: ${operation}`);
+  constructor(
+    readonly operation: string,
+    options?: AnalysisErrorOptions,
+  ) {
+    super(`Analysis operation was cancelled: ${operation}`, options);
   }
 }
 
@@ -84,9 +123,11 @@ export class AnalysisTimeoutError extends AnalysisError {
   constructor(
     readonly operation: string,
     readonly timeoutMs: number,
+    options?: AnalysisErrorOptions,
   ) {
     super(
       `Analysis operation timed out after ${String(timeoutMs)}ms: ${operation}`,
+      options,
     );
   }
 }
@@ -98,7 +139,7 @@ export class AnalysisAccessDeniedError extends AnalysisError {
     readonly operation: string,
     readonly path: string,
     readonly systemCode: "EACCES" | "EPERM",
-    options?: ErrorOptions,
+    options?: AnalysisErrorOptions,
   ) {
     super(
       `Host filesystem read access denied (${systemCode}) for ${path} during ${operation}`,
@@ -114,7 +155,7 @@ export class AnalysisArtifactChangedError extends AnalysisError {
     readonly operation: string,
     readonly path: string,
     readonly reason: string,
-    options?: ErrorOptions,
+    options?: AnalysisErrorOptions,
   ) {
     super(`Selected artifact changed during acquisition: ${reason}`, options);
   }

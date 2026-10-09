@@ -5,6 +5,8 @@ import {
 export { NATIVE_MACOS_PROVIDER_IDENTITY } from "./NativeMacOSProviderMetadata.js";
 import { inspectAppleDispatchMetadata } from "./AppleDispatchMetadata.js";
 import { observeNativeUi } from "./NativeUiObservation.js";
+import { LldbCallTracer, type NativeCallTracer } from "./LldbCallTracer.js";
+import { observeNativeCalls } from "./NativeCallObservation.js";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { open, realpath, stat } from "node:fs/promises";
 
@@ -29,6 +31,8 @@ import {
   AnalysisCapabilityUnavailableError,
   AnalysisInputError,
   AnalysisOutputError,
+  AnalysisResourceConstraintError,
+  AnalysisTimeoutError,
 } from "../domain/analysisErrorCore.js";
 import { BinaryTargetError } from "../domain/configurationErrors.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
@@ -47,11 +51,18 @@ import {
 } from "../domain/native/nativeInspection.js";
 import { err, ok, type Result } from "../domain/result.js";
 import {
+  NATIVE_COMMAND_TIMEOUT_MS,
+  NATIVE_COMMAND_OUTPUT_BUDGET_BYTES,
   NativeCommandFailure,
   XcrunCommandRunner,
   type NativeCommandCapture,
   type NativeCommandRunner,
 } from "./CommandRunner.js";
+import {
+  withSignatureTarget,
+  verifySignatureTarget,
+  type SignatureTargetBinding,
+} from "./SignatureTargetBinding.js";
 import { parseCodeSignature } from "./parsers/codesign.js";
 import { parseDemangledSymbols } from "./parsers/demangle.js";
 import { parseLipoArchitectures } from "./parsers/lipo.js";
@@ -72,6 +83,7 @@ export class NativeMacOSProvider implements AnalysisProvider {
   constructor(
     private readonly runner: NativeCommandRunner = new XcrunCommandRunner(),
     platform: NodeJS.Platform = process.platform,
+    private readonly tracer: NativeCallTracer = new LldbCallTracer(),
   ) {
     this.#capabilities = nativeMacOSCapabilities(platform);
   }
@@ -85,7 +97,7 @@ export class NativeMacOSProvider implements AnalysisProvider {
   }
 
   createClient(target: BinaryTarget): AnalysisClient {
-    return new NativeMacOSClient(target, this.runner);
+    return new NativeMacOSClient(target, this.runner, this.tracer);
   }
 }
 
@@ -93,6 +105,7 @@ class NativeMacOSClient implements AnalysisClient {
   constructor(
     private readonly target: BinaryTarget,
     private readonly runner: NativeCommandRunner,
+    private readonly tracer: NativeCallTracer,
   ) {}
 
   async execute(
@@ -157,6 +170,22 @@ class NativeMacOSClient implements AnalysisClient {
           "Operation is not implemented by native macOS tools.",
         ),
       );
+    if (operation === "observe_native_calls") {
+      const result = await observeNativeCalls(
+        this.target,
+        parameters,
+        this.tracer,
+        options?.signal,
+      );
+      return result.ok
+        ? ok(
+            createAnalysisExecution(result.value, IDENTITY, {
+              limitations: result.value.limitations,
+              locations: [{ kind: "artifact-path", path: this.target.path }],
+            }),
+          )
+        : result;
+    }
     if (
       operation === "observe_native_ui" ||
       operation === "capture_native_ui_scenario"
@@ -208,6 +237,7 @@ class NativeMacOSClient implements AnalysisClient {
     switch (operation) {
       case "observe_native_ui":
       case "capture_native_ui_scenario":
+      case "observe_native_calls":
         return Promise.resolve(
           err(
             new AnalysisCapabilityUnavailableError(
@@ -297,38 +327,46 @@ class NativeMacOSClient implements AnalysisClient {
   async #inspectSignature(
     signal?: AbortSignal,
   ): Promise<Result<NativeObservation, AnalysisError>> {
-    const display = await this.#run(
-      "inspect_signature",
-      "codesign",
-      ["-d", "--verbose=4", this.target.path],
-      { signal, acceptNonZero: true },
+    return withSignatureTarget(
+      this.target,
+      (binding) => this.#inspectBoundSignature(binding, signal),
+      signal,
+    );
+  }
+
+  async #inspectBoundSignature(
+    binding: SignatureTargetBinding,
+    signal?: AbortSignal,
+  ): Promise<Result<NativeObservation, AnalysisError>> {
+    const display = await this.#captureSignature(
+      binding,
+      ["-d", "--verbose=4"],
+      signal,
     );
     if (!display.ok) return display;
     const unsigned = isNonzeroUnsignedObservation(display.value);
     const displayFailure = codeSignCaptureFailure(display.value);
     if (displayFailure !== null) return err(displayFailure);
-    const requirements = await this.#run(
-      "inspect_signature",
-      "codesign",
-      ["-d", "-r-", this.target.path],
-      { signal, acceptNonZero: true },
+    const requirements = await this.#captureSignature(
+      binding,
+      ["-d", "-r-"],
+      signal,
     );
     if (!requirements.ok) return requirements;
     const requirementsFailure = codeSignCaptureFailure(requirements.value);
     if (requirementsFailure !== null) return err(requirementsFailure);
-    const entitlements = await this.#run(
-      "inspect_signature",
-      "codesign",
-      ["-d", "--entitlements", ":-", this.target.path],
-      { signal, acceptNonZero: true },
+    const entitlements = await this.#captureSignature(
+      binding,
+      ["-d", "--entitlements", ":-"],
+      signal,
     );
     if (!entitlements.ok) return entitlements;
     const entitlementsFailure = codeSignCaptureFailure(entitlements.value);
     if (entitlementsFailure !== null) return err(entitlementsFailure);
     // codesign echoes the resolved executable path in its diagnostics.
     const parsed = parseCodeSignature(display.value.stderr, unsigned, [
-      this.target.path,
-      ...(await canonicalPath(this.target.path)),
+      binding.snapshotPath,
+      ...(await canonicalPath(binding.snapshotPath)),
     ]);
     // The requirement is printed to stdout; stderr echoes the path.
     const requirementText =
@@ -338,6 +376,7 @@ class NativeMacOSClient implements AnalysisClient {
     const captures = [display.value, requirements.value, entitlements.value];
     const limitations = [
       ...parsed.limitations,
+      "Inspected a digest-verified Mach-O byte snapshot; filesystem-bound signing context and trust validation are not examined.",
       ...(entitlementValue.omittedPrototypeKeys === 0
         ? []
         : [
@@ -350,9 +389,12 @@ class NativeMacOSClient implements AnalysisClient {
         isNonzeroUnsignedObservation(entitlements.value));
     if (mixedSigning) {
       const slices = await this.#inspectMixedSignatureSlices(
+        binding,
         parsed.format,
-        requirements.value.exitCode !== 0,
-        entitlements.value.exitCode !== 0,
+        {
+          requirements: requirements.value.exitCode,
+          entitlements: entitlements.value.exitCode,
+        },
         signal,
       );
       if (!slices.ok) return slices;
@@ -360,8 +402,10 @@ class NativeMacOSClient implements AnalysisClient {
       limitations.push(...slices.value.limitations);
     }
     const provenance = captures.map((capture) =>
-      invocation(capture, this.target.path),
+      invocation(capture, binding.snapshotPath),
     );
+    const version = await verifySignatureTarget(this.target, binding, signal);
+    if (!version.ok) return version;
     const result = inspectSignatureSchema.parse({
       ...parsed,
       designated_requirement: requirementText,
@@ -378,20 +422,22 @@ class NativeMacOSClient implements AnalysisClient {
   }
 
   async #inspectMixedSignatureSlices(
+    binding: SignatureTargetBinding,
     format: string | null,
-    requirementsUnavailable: boolean,
-    entitlementsUnavailable: boolean,
+    aggregateExits: Readonly<{
+      requirements: number | null;
+      entitlements: number | null;
+    }>,
     signal?: AbortSignal,
   ): Promise<Result<MixedSignatureSlices, AnalysisError>> {
     const captures: NativeCommandCapture[] = [];
     const unsigned: string[] = [];
     const unclassified: string[] = [];
     for (const architecture of codeSignArchitectures(format, this.target)) {
-      const slice = await this.#run(
-        "inspect_signature",
-        "codesign",
-        ["-d", "-a", architecture, "--verbose=4", this.target.path],
-        { signal, acceptNonZero: true },
+      const slice = await this.#captureSignature(
+        binding,
+        ["-d", "-a", architecture, "--verbose=4"],
+        signal,
       );
       if (!slice.ok) return slice;
       captures.push(slice.value);
@@ -409,15 +455,51 @@ class NativeMacOSClient implements AnalysisClient {
       limitations.push(
         `Signature state could not be classified for Mach-O slices: ${unclassified.join(", ")}.`,
       );
-    if (requirementsUnavailable)
+    if (aggregateExits.requirements !== 0)
       limitations.push(
         "The aggregate designated requirement is unavailable because Mach-O slices have mixed signing states.",
       );
-    if (entitlementsUnavailable)
+    if (aggregateExits.entitlements !== 0)
       limitations.push(
         "The aggregate entitlements are unavailable because Mach-O slices have mixed signing states.",
       );
     return ok({ captures, limitations });
+  }
+
+  async #captureSignature(
+    binding: SignatureTargetBinding,
+    args: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<Result<NativeCommandCapture, AnalysisError>> {
+    const before = await verifySignatureTarget(this.target, binding, signal);
+    if (!before.ok) return before;
+    let capture: Result<NativeCommandCapture, AnalysisError>;
+    try {
+      capture = await this.#run(
+        "inspect_signature",
+        "codesign",
+        [...args, binding.snapshotPath],
+        {
+          signal,
+          acceptNonZero: true,
+        },
+      );
+    } catch (cause: unknown) {
+      capture = err(
+        new ProviderAdapterError(IDENTITY.id, "inspect_signature", {
+          cause,
+          diagnostics: {
+            phase: "codesign-capture",
+            path: this.target.path,
+            reason: cause instanceof Error ? cause.message : String(cause),
+          },
+        }),
+      );
+    }
+    // Verify failed captures too: a disappearing target is not a codesign
+    // execution failure, and later captures must never use another version.
+    const after = await verifySignatureTarget(this.target, binding, signal);
+    return after.ok ? capture : after;
   }
 
   async #inspectPlist(
@@ -563,15 +645,64 @@ const translateCommandFailure = (
   operation: NativeToolName,
   failure: NativeCommandFailure,
 ): AnalysisError => {
+  const capturedOutput =
+    failure.capture === null
+      ? undefined
+      : {
+          stdout: failure.capture.stdout,
+          stderr: failure.capture.stderr,
+          truncated: failure.capture.truncated,
+          stdout_bytes: failure.capture.stdoutBytes,
+          stderr_bytes: failure.capture.stderrBytes,
+          exit_code: failure.capture.exitCode,
+          signal: failure.capture.signal,
+        };
+  const cleanup =
+    failure.cleanupFailure === null
+      ? undefined
+      : {
+          reason: failure.cleanupFailure,
+          resources: [...failure.cleanupResources],
+        };
+  const errorOptions = {
+    ...(capturedOutput === undefined ? {} : { capturedOutput }),
+    ...(cleanup === undefined ? {} : { cleanup }),
+  };
   if (failure.reason === "unavailable")
     return new AnalysisCapabilityUnavailableError(
       IDENTITY.id,
       operation,
       `${failure.tool} is unavailable through xcrun.`,
+      errorOptions,
     );
   if (failure.reason === "cancelled")
-    return new AnalysisCancelledError(operation);
-  return new ProviderAdapterError(IDENTITY.id, operation, { cause: failure });
+    return new AnalysisCancelledError(operation, errorOptions);
+  if (failure.reason === "timeout")
+    return new AnalysisTimeoutError(
+      operation,
+      NATIVE_COMMAND_TIMEOUT_MS,
+      errorOptions,
+    );
+  if (failure.reason === "output-limit")
+    return new AnalysisResourceConstraintError(
+      operation,
+      "memory",
+      `Native command output exceeded ${String(NATIVE_COMMAND_OUTPUT_BUDGET_BYTES)} bytes; complete output is required for analysis.`,
+      { max_output_bytes: NATIVE_COMMAND_OUTPUT_BUDGET_BYTES },
+      errorOptions,
+    );
+  return new ProviderAdapterError(IDENTITY.id, operation, {
+    cause: failure,
+    ...errorOptions,
+    diagnostics: {
+      tool: failure.tool,
+      reason: failure.reason,
+      exit_code: failure.capture?.exitCode ?? failure.exitCode,
+      signal: failure.capture?.signal ?? null,
+      stdout_bytes: failure.capture?.stdoutBytes ?? 0,
+      stderr_bytes: failure.capture?.stderrBytes ?? 0,
+    },
+  });
 };
 
 const translateCodeSignExitFailure = (
@@ -579,7 +710,21 @@ const translateCodeSignExitFailure = (
 ): AnalysisError =>
   translateCommandFailure(
     "inspect_signature",
-    new NativeCommandFailure("codesign", "nonzero-exit", capture.exitCode),
+    new NativeCommandFailure(
+      "codesign",
+      "nonzero-exit",
+      capture.exitCode,
+      undefined,
+      {
+        stdout: capture.stdout,
+        stderr: capture.stderr,
+        stdoutBytes: capture.stdoutBytes,
+        stderrBytes: capture.stderrBytes,
+        exitCode: capture.exitCode,
+        signal: capture.signal,
+        truncated: false,
+      },
+    ),
   );
 
 const commandOutput = (capture: NativeCommandCapture): string =>

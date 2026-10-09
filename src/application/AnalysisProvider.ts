@@ -14,6 +14,7 @@ import { jsonValueSchema } from "../domain/jsonValue.js";
 import type { ProgressReporter } from "./ProgressReporter.js";
 import type { ProviderRejectionCode } from "../contracts/providerSelection.js";
 import type { ProcessLineageObservation } from "../process/ProcessOwnership.js";
+import type { ProviderOperationHealth } from "../domain/providerOperationHealth.js";
 
 export interface ExecutionOptions {
   readonly signal?: AbortSignal;
@@ -99,6 +100,8 @@ export interface AnalysisClient extends AnalysisOperationPort {
   runtimeLineageSnapshots?(): readonly ProviderRuntimeLineageSnapshot[];
   /** Current provider work that may outlive a timed-out or cancelled caller. */
   requestActivitySnapshots?(): readonly ProviderRequestActivitySnapshot[];
+  /** Current operational health for the active provider bridge. */
+  operationHealthSnapshot?(): ProviderOperationHealth | undefined;
   /** Close with a typed result when the provider can verify cleanup. */
   closeWithOutcome?(
     options?: Pick<ExecutionOptions, "progress"> & {
@@ -159,7 +162,12 @@ type CapabilityAvailability =
     };
 
 export type CapabilityDescriptor = CapabilityAvailability & {
-  /** Live external state must be re-observed, including after snapshot import. */
+  /**
+   * Snapshot opts immutable, profile-bound reads into replay despite incidental
+   * private filesystem writes. Live state must always be re-observed. Omitting
+   * this policy retains conservative effect checks; mutation and UI-state
+   * exclusions apply to every policy.
+   */
   readonly cachePolicy?: "snapshot" | "live";
   readonly provider: ProviderIdentity;
   readonly operation: Exclude<AnalysisOperation, "health">;

@@ -14,6 +14,8 @@ import {
   buildMacosBundleFixture,
   preflightMacosBundleFixture,
 } from "../../fixtures/apple/macos-bundle.mjs";
+import { verifyDyldEnvironment } from "./dyld-environment.mjs";
+import { verifyDylibResolution } from "./macos-dylib-e2e.mjs";
 
 const exec = promisify(execFile);
 
@@ -63,6 +65,7 @@ const EXPECTED_BUNDLES = [
   ["Contents/XPCServices/Svc.xpc", "xpc-service", "macos-deep", "."],
 ];
 
+let report;
 try {
   const { app } = await buildMacosBundleFixture(root);
   const zip = join(root, "MacFixture.zip");
@@ -150,18 +153,21 @@ try {
   assert.deepEqual(anatomies[2], anatomies[0], "DMG anatomy differs");
   const { stdout: attached } = await exec("/usr/bin/hdiutil", ["info"]);
   assert.ok(!attached.includes(dmg), "DMG remained attached after inventory");
+  const dylibs = await verifyDylibResolution(app);
+  const dyldEnvironment = await verifyDyldEnvironment(root);
 
-  process.stdout.write(
-    `${JSON.stringify({
-      ok: true,
-      mocked: false,
-      cli: true,
-      stdio_mcp: true,
-      containers: containers.map(({ format }) => format),
-      bundles: EXPECTED_BUNDLES.length,
-      dmg_detached: true,
-    })}\n`,
-  );
+  report = {
+    ok: true,
+    mocked: false,
+    cli: true,
+    stdio_mcp: true,
+    containers: containers.map(({ format }) => format),
+    bundles: EXPECTED_BUNDLES.length,
+    dmg_detached: true,
+    dylib_resolution: dylibs,
+    dyld_environment: dyldEnvironment,
+  };
 } finally {
   await rm(root, { recursive: true, force: true });
 }
+process.stdout.write(`${JSON.stringify(report)}\n`);

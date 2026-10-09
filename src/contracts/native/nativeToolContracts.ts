@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { nativeCallObservationInputSchema } from "../../domain/native/nativeCallObservation.js";
 import {
   nativeUiObservationInputSchema,
   nativeUiScenarioInputSchema,
@@ -7,6 +8,7 @@ import {
 import type { ToolContract } from "../toolContracts.js";
 import { nativeOutputSchemas } from "../toolOutputSchemas.js";
 import { jsonValueSchema } from "../../domain/jsonValue.js";
+import { localPathStringSchema } from "../../domain/localPath.js";
 import { toolContractMetadata } from "../toolEffects.js";
 import { requireOutputSchema } from "../toolOutputSchemaPrimitives.js";
 
@@ -22,6 +24,19 @@ const examples: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
     steps: [{ kind: "wait", milliseconds: 100 }],
   },
   demangle_swift: { symbols: ["$s4Test3fooyyF"] },
+  observe_native_calls: {
+    breakpoints: [
+      {
+        kind: "objc-method",
+        class_name: "NSURLSession",
+        selector: "dataTaskWithRequest:completionHandler:",
+      },
+      { kind: "function", name: "open", module: "libsystem_kernel.dylib" },
+    ],
+    arguments: ["--help"],
+    duration_ms: 5000,
+    backtrace_frames: 4,
+  },
 };
 
 const native = <Name extends string, Schema extends z.ZodObject>(
@@ -55,7 +70,8 @@ export const swiftSymbolsSchema = z
     z
       .string()
       .min(1)
-      .regex(/^[^\n]*$/u, "Each Swift symbol must be one line."),
+      .regex(/^[^\n]*$/u, "Each Swift symbol must be one line.")
+      .regex(/^[^\0]*$/u, "Swift symbols cannot contain NUL."),
   )
   .min(1);
 
@@ -72,6 +88,11 @@ export const NATIVE_TOOL_CONTRACTS = [
     nativeUiScenarioInputSchema,
   ),
   native(
+    "observe_native_calls",
+    "Launch the active Mach-O as an owned process under LLDB and record each entry into caller-selected functions or Objective-C methods: thread, module, symbol, load and file address, raw argument registers, selector, receiver class and optional caller frames. Every hit auto-continues. No expression is evaluated and no other process is attached. The process is killed when max_events or duration_ms is reached; exit status, captured stdout/stderr, unresolved breakpoints and limitations are returned inline. The process runs with the current user's permissions and may change files, show UI or use the network. A hardened-runtime target needs the get-task-allow entitlement.",
+    nativeCallObservationInputSchema,
+  ),
+  native(
     "inspect_macho",
     "Inspect Mach-O slices, load commands, imports, exports, dependencies, build metadata, segments, sections, permissions, and exact command provenance without launching Hopper.",
     z.object({}),
@@ -85,7 +106,7 @@ export const NATIVE_TOOL_CONTRACTS = [
     "inspect_plist",
     "Parse Info.plist from the active artifact by default, or pass any local plist path. Returns normalized JSON rather than plutil text.",
     z.object({
-      path: z.string().min(1).optional(),
+      path: localPathStringSchema.optional(),
     }),
   ),
   native(
